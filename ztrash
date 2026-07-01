@@ -1,0 +1,729 @@
+#!/usr/bin/env zsh
+#
+# ztrash - A polished, FreeDesktop-compliant trash manager
+#
+# MIT License
+# Copyright (c) 2026 AceMinerOjal
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+
+VERSION="1.0.0"
+
+# --- Configuration & Setup ---
+setopt EXTENDED_GLOB NO_UNSET
+
+TRASH_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
+FILES_DIR="$TRASH_DIR/files"
+INFO_DIR="$TRASH_DIR/info"
+
+mkdir -p "$FILES_DIR" "$INFO_DIR"
+
+if [[ -t 1 ]]; then
+    BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m'
+    YELLOW=$'\e[33m' BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' RESET=$'\e[0m'
+else
+    BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" RESET=""
+fi
+
+# --- Helpers ---
+
+url_decode() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]), end='')" "$1"
+    else
+        local str="$1" decoded=""
+        while [[ -n "$str" ]]; do
+            if [[ "$str" = '%'([0-9a-fA-F][0-9a-fA-F])* ]]; then
+                decoded+="\\x${match[1]}"
+                str="${str#%??}"
+            else
+                decoded+="${str[1]}"
+                str="${str:1}"
+            fi
+        done
+        printf '%b' "$decoded"
+    fi
+}
+
+url_encode() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]), end='')" "$1"
+    else
+        local str="$1" encoded="" c
+        for (( i = 1; i <= ${#str}; i++ )); do
+            c="$str[i]"
+            case "$c" in
+                [a-zA-Z0-9._~-]) encoded+="$c" ;;
+                *) printf -v hex '%%%02X' "'$c"; encoded+="$hex" ;;
+            esac
+        done
+        printf '%s' "$encoded"
+    fi
+}
+
+get_size() {
+    if [[ -e "$1" || -L "$1" ]]; then
+        du -sh "$1" | cut -f1
+    else
+        echo "0B"
+    fi
+}
+
+format_bytes() {
+    local bytes=$1
+    if (( bytes < 1024 )); then
+        printf "%dB\n" "$bytes"
+    elif (( bytes < 1048576 )); then
+        printf "%.1fK\n" "$(( bytes / 1024. ))"
+    elif (( bytes < 1073741824 )); then
+        printf "%.1fM\n" "$(( bytes / 1048576. ))"
+    else
+        printf "%.1fG\n" "$(( bytes / 1073741824. ))"
+    fi
+}
+
+truncate_path() {
+    local path="$1" max=$2
+    if [[ $max -le 0 ]]; then
+        printf ''
+    elif [[ $max -lt 4 ]]; then
+        printf '%s' "${path:0:$max}"
+    elif [[ ${#path} -gt $max ]]; then
+        local half=$(( (max - 3) / 2 ))
+        local half2=$(( max - 3 - half ))
+        printf '%s' "${path:0:$half}...${path: -$half2}"
+    else
+        printf '%s' "$path"
+    fi
+}
+
+date_to_epoch() {
+    local date_str="$1"
+    local epoch=$(date -d "$date_str" +%s 2>/dev/null)
+    if [[ -z "$epoch" ]] && command -v python3 >/dev/null 2>&1; then
+        epoch=$(python3 -c "
+import sys
+from datetime import datetime
+try:
+    dt = datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%S')
+    print(int(dt.timestamp()), end='')
+except:
+    pass
+" "$date_str" 2>/dev/null)
+    fi
+    echo "$epoch"
+}
+
+purge_trash() {
+    local days=$1
+    local cutoff=$(date -d "$days days ago" +%s 2>/dev/null)
+    if [[ -z "$cutoff" ]] && command -v python3 >/dev/null 2>&1; then
+        cutoff=$(python3 -c "from datetime import datetime, timedelta; print(int((datetime.now() - timedelta(days=$days)).timestamp()), end='')" 2>/dev/null)
+    fi
+    if [[ -z "$cutoff" ]]; then
+        echo "${RED}Error: Cannot compute cutoff date.${RESET}" >&2
+        return 1
+    fi
+
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    local count=0 freed_bytes=0
+    for f in $info_files; do
+        local del_date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
+        if [[ -n "$del_date" ]]; then
+            local del_epoch=$(date_to_epoch "$del_date")
+            if [[ -n "$del_epoch" && "$del_epoch" -lt "$cutoff" ]]; then
+                local base=$(basename "$f" .trashinfo)
+                local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
+                freed_bytes=$(( freed_bytes + ${fbytes:-0} ))
+                rm -rf "$FILES_DIR/$base" "$INFO_DIR/$base.trashinfo"
+                ((count++))
+            fi
+        fi
+    done
+    local freed_fmt=$(format_bytes $freed_bytes)
+    echo "${CYAN}Purged${RESET} ${RED}${BOLD}$count${RESET} item(s) (${YELLOW}$freed_fmt${RESET}) older than ${MAGENTA}$days${RESET} day(s)."
+}
+
+print_completion() {
+    local shell="$1"
+    case "$shell" in
+        bash)
+            cat <<'EOF'
+_trash() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="-l --list -r --restore -d --delete -e --empty -s --size -u --undo -w --watch -p --purge --fzf -v --verbose --version -h --help"
+    case "$prev" in
+        -p|--purge) return ;;
+    esac
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+    else
+        COMPREPLY=( $(compgen -W "${opts} restore find" -- "${cur}") )
+    fi
+}
+complete -F _trash ztrash
+EOF
+            ;;
+        zsh)
+            cat <<'EOF'
+#compdef ztrash
+
+_trash() {
+    local -a ops
+    ops=(
+        '-l[list trash contents]'
+        '--list[list trash contents]'
+        '-r[interactively restore items]'
+        '--restore[interactively restore items]'
+        '-d[interactively delete items]'
+        '--delete[interactively delete items]'
+        '-e[empty the trash]'
+        '--empty[empty the trash]'
+        '-s[show trash size]'
+        '--size[show trash size]'
+        '-u[undo last trash]'
+        '--undo[undo last trash]'
+        '-w[watch trash size]'
+        '--watch[watch trash size]'
+        '-p[purge items older than N days]:days'
+        '--purge[purge items older than N days]:days'
+        '--fzf[fuzzy-find items]'
+        '-v[verbose output]'
+        '--verbose[verbose output]'
+        '-h[show help]'
+        '--help[show help]'
+        '--version[show version]'
+        'restore:restore items matching a pattern:'
+        'find:search trashed items:'
+    )
+    _arguments "$ops[@]" '*:files:_files'
+}
+
+_trash "$@"
+EOF
+            ;;
+        fish)
+            cat <<'EOF'
+complete -c ztrash -s l -l list -d 'List trash contents'
+complete -c ztrash -s r -l restore -d 'Interactively restore items'
+complete -c ztrash -s d -l delete -d 'Interactively delete items'
+complete -c ztrash -s e -l empty -d 'Empty the trash'
+complete -c ztrash -s s -l size -d 'Show trash size'
+complete -c ztrash -s u -l undo -d 'Undo last trash'
+complete -c ztrash -s w -l watch -d 'Watch trash size'
+complete -c ztrash -s p -l purge -d 'Purge items older than N days' -r
+complete -c ztrash -l fzf -d 'Fuzzy-find items'
+complete -c ztrash -s v -l verbose -d 'Verbose output'
+complete -c ztrash -s h -l help -d 'Show help'
+complete -c ztrash -l version -d 'Show version'
+complete -c ztrash -n '__fish_use_subcommand' -a restore -d 'Restore items matching a pattern'
+complete -c ztrash -n '__fish_use_subcommand' -a find -d 'Search trashed items'
+EOF
+            ;;
+        *)
+            echo "${RED}Unknown shell: $shell (supported: bash, zsh, fish)${RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
+show_help() {
+    cat <<EOF
+${BOLD}${CYAN}Usage:${RESET} ${DIM}ztrash${RESET} [${GREEN}options${RESET}] [${YELLOW}file...${RESET}]
+
+${BOLD}${CYAN}Options:${RESET}
+  ${GREEN}-l, --list${RESET}          ${CYAN}List items in trash${RESET}
+  ${GREEN}-r, --restore${RESET}       ${CYAN}Interactively restore items${RESET}
+  ${GREEN}-d, --delete${RESET}        ${CYAN}Interactively delete specific items${RESET}
+  ${GREEN}-e, --empty${RESET}         ${CYAN}Empty the trash${RESET}
+  ${GREEN}-s, --size${RESET}          ${CYAN}Show trash size${RESET}
+  ${GREEN}-u, --undo${RESET}          ${CYAN}Restore the most recently trashed item${RESET}
+  ${GREEN}-w, --watch${RESET}         ${CYAN}Live-updating trash size display${RESET}
+  ${GREEN}-p, --purge${RESET} ${YELLOW}<days>${RESET}  ${CYAN}Permanently delete items older than N days${RESET}
+  ${GREEN}--fzf${RESET}               ${CYAN}Fuzzy-find items to restore or delete${RESET}
+  ${GREEN}-v, --verbose${RESET}       ${CYAN}Verbose output${RESET}
+  ${GREEN}--version${RESET}           ${CYAN}Show version${RESET}
+  ${GREEN}-h, --help${RESET}          ${CYAN}Show this help message${RESET}
+
+${BOLD}${MAGENTA}Subcommands:${RESET}
+  ${GREEN}restore${RESET} ${YELLOW}<pattern>${RESET}   ${MAGENTA}Restore items matching a pattern${RESET}
+  ${GREEN}find${RESET} ${YELLOW}<pattern>${RESET}      ${MAGENTA}Search trashed items by name or path${RESET}
+
+${BOLD}${BLUE}Description:${RESET}
+  If no options are provided, moves the specified files or directories
+  to the trash according to the ${BOLD}FreeDesktop.org${RESET} specification.
+
+${BOLD}${YELLOW}Examples:${RESET}
+  ${DIM}ztrash${RESET} ${CYAN}homework.pdf${RESET} ${CYAN}regrettable_photo.jpg${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}-l${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}-p${RESET} ${YELLOW}30${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}restore${RESET} ${YELLOW}"*.bak"${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}find${RESET} ${YELLOW}important${RESET}
+EOF
+}
+
+# --- Actions ---
+
+list_trash() {
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    if [[ ${#info_files} -eq 0 ]]; then
+        echo "${GREEN}Trash is empty.${RESET}"
+        return
+    fi
+
+    local total_items=${#info_files}
+    local lines=() total_bytes=0
+    local term_cols=${COLUMNS:-80}
+    local path_col=$(( term_cols - 28 ))
+
+    for f in $info_files; do
+        local binned_date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
+        local encoded_path=$(grep "^Path=" "$f" | cut -d= -f2-)
+        local decoded_path=$(url_decode "${encoded_path:-}")
+        local base=$(basename "$f" .trashinfo)
+        local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
+        fbytes=${fbytes:-0}
+        local fsize=$(format_bytes $fbytes)
+        total_bytes=$(( total_bytes + fbytes ))
+        decoded_path=$(truncate_path "$decoded_path" $path_col)
+        lines+=("${binned_date:-Unknown}|${fsize}|${decoded_path:-${encoded_path:-Unknown}}")
+    done
+
+    local total_fmt=$(format_bytes $total_bytes)
+
+    echo "  ${BOLD}${CYAN}Trash${RESET}  ${DIM}(${YELLOW}$total_items${RESET}${DIM} item(s), ${YELLOW}$total_fmt${RESET}${DIM})${RESET}"
+    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
+    printf "  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  ${BLUE}%s${RESET}\n" "Binned" "Size" "Path"
+    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
+
+    local sorted_lines=("${(@f)$(printf '%s\n' "${lines[@]}" | sort -t'|' -k1,1r)}")
+    local idx=0
+    for line in "${sorted_lines[@]}"; do
+        local parts=("${(s:|:)line}")
+        if (( idx % 2 == 0 )); then
+            printf "  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  %s\n" "$parts[1]" "$parts[2]" "$parts[3]"
+        else
+            printf "${DIM}  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  %s${RESET}\n" "$parts[1]" "$parts[2]" "$parts[3]"
+        fi
+        ((idx++))
+    done
+
+    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
+    printf "  %-17s  ${BOLD}${YELLOW}%5s${RESET}  ${BOLD}${BLUE}%s${RESET}\n" "" "$total_fmt" "Total"
+}
+
+move_to_trash() {
+    local verbose=false
+    if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
+        verbose=true
+        shift
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        show_help
+        return 1
+    fi
+
+    for target in "$@"; do
+        if [[ ! -e "$target" && ! -L "$target" ]]; then
+            echo "${RED}Error: '$target' does not exist.${RESET}" >&2
+            continue
+        fi
+
+        local abs_path=$(realpath -s "$target")
+        local base_name=$(basename "$abs_path")
+        local date_stamp=$(date +%Y-%m-%dT%H:%M:%S)
+        local encoded=$(url_encode "$abs_path")
+
+        local unique_name="${base_name}_${$}_${RANDOM}"
+        while [[ -e "$FILES_DIR/$unique_name" ]]; do
+            unique_name="${base_name}_${$}_${RANDOM}"
+        done
+
+        if mv -n "$target" "$FILES_DIR/$unique_name" 2>/dev/null; then
+            :
+        else
+            unique_name="${base_name}_${$}_${RANDOM}"
+            if ! cp -a "$target" "$FILES_DIR/$unique_name" 2>/dev/null; then
+                echo "${RED}Error: Failed to move '$target' to trash.${RESET}" >&2
+                continue
+            fi
+            rm -rf "$target"
+        fi
+
+        cat <<EOF > "$INFO_DIR/${unique_name}.trashinfo"
+[Trash Info]
+Path=$encoded
+DeletionDate=$date_stamp
+EOF
+        [[ "$verbose" == true ]] && echo "  ${GREEN}✓${RESET} ${BOLD}Binned${RESET} '${CYAN}$(basename "$target")${RESET}'"
+    done
+}
+
+empty_trash() {
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    local count=${#info_files}
+    local total_size=$(du -sh "$FILES_DIR" | cut -f1)
+    [[ "$total_size" == "0" ]] && total_size="0B"
+    echo -n "${RED}${BOLD}Really empty the trash?${RESET} ${YELLOW}$count${RESET} item(s), ${BOLD}${YELLOW}$total_size${RESET}. [${RED}y${RESET}/${DIM}N${RESET}]: "
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        rm -rf "$FILES_DIR"/*(DN) "$INFO_DIR"/*(DN)
+        echo "${GREEN}${BOLD}Trash emptied.${RESET} ${YELLOW}$total_size${RESET} freed."
+    else
+        echo "${YELLOW}Aborted.${RESET} Trash not emptied."
+    fi
+}
+
+show_size() {
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    local total_size=$(du -sh "$FILES_DIR" | cut -f1)
+    echo "Trash size: ${BOLD}${YELLOW}$total_size${RESET} ${DIM}(${CYAN}${#info_files}${RESET}${DIM} item(s))${RESET}"
+}
+
+undo_trash() {
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    if [[ ${#info_files} -eq 0 ]]; then
+        echo "${YELLOW}Nothing to undo.${RESET} The bin is empty."
+        return
+    fi
+
+    local newest="" newest_date=""
+    for f in $info_files; do
+        local d=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
+        [[ -z "$d" ]] && continue
+        if [[ -z "$newest_date" || "$d" > "$newest_date" ]]; then
+            newest_date="$d"
+            newest="$f"
+        fi
+    done
+
+    if [[ -z "$newest" ]]; then
+        echo "${YELLOW}Nothing to undo.${RESET}"
+        return
+    fi
+
+    local base=$(basename "$newest" .trashinfo)
+    local encoded_path=$(grep "^Path=" "$newest" | cut -d= -f2-)
+    [[ -z "$encoded_path" ]] && return
+    local decoded_path=$(url_decode "$encoded_path")
+    [[ -z "$decoded_path" ]] && return
+    local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
+    local fsize=$(format_bytes ${fbytes:-0})
+
+    if [[ -e "$decoded_path" ]]; then
+        local term_cols=${COLUMNS:-80}
+        local disp=$(truncate_path "$decoded_path" $(( term_cols - 40 )))
+        echo -n "${YELLOW}'$disp' already exists. Overwrite? [y/N]: ${RESET}"
+        read -r ov
+        [[ ! "$ov" =~ ^[Yy]$ ]] && return
+    fi
+    mkdir -p "$(dirname "$decoded_path")"
+    if mv "$FILES_DIR/$base" "$decoded_path"; then
+        rm -f "$INFO_DIR/$base.trashinfo"
+        echo "  ${GREEN}✓${RESET} Undone: '$(basename "$decoded_path")' (${fsize})"
+    else
+        echo "  ${RED}✗${RESET} Failed to undo" >&2
+    fi
+}
+
+watch_trash() {
+    while true; do
+        clear
+        printf "${BOLD}${CYAN}Trash watcher${RESET} ${DIM}(Ctrl+C to stop)${RESET}\n\n"
+        show_size
+        sleep 2
+    done
+}
+
+fzf_action() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "${RED}fzf is not installed. Install it with your package manager.${RESET}" >&2
+        return 1
+    fi
+
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    if [[ ${#info_files} -eq 0 ]]; then
+        echo "${GREEN}The bin is empty.${RESET}"
+        return
+    fi
+
+    local fzf_input=()
+    for f in $info_files; do
+        local base=$(basename "$f" .trashinfo)
+        local date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
+        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
+        local decoded=$(url_decode "$encoded")
+        local size=$(get_size "$FILES_DIR/$base")
+        fzf_input+=("$base|$date | $size | $decoded")
+    done
+
+    local choice=$(printf "%s\n" "${fzf_input[@]}" | fzf --reverse --prompt="Select item: " --with-nth=2.. --delimiter="|")
+    [[ -z "$choice" ]] && return
+
+    local trash_name="${choice%%|*}"
+    [[ -z "$trash_name" ]] && return
+    local encoded=$(grep "^Path=" "$INFO_DIR/$trash_name.trashinfo" | cut -d= -f2-)
+    [[ -z "$encoded" ]] && return
+    local orig_path=$(url_decode "$encoded")
+    [[ -z "$orig_path" ]] && return
+
+    echo "${CYAN}Selected:${RESET} ${BOLD}$(basename "$orig_path")${RESET}"
+    echo -n "${BOLD}${GREEN}(R)estore${RESET} or ${BOLD}${RED}(D)elete${RESET}? [${GREEN}r${RESET}/${RED}D${RESET}/${DIM}q${RESET}]: "
+    read -r action
+    case "$action" in
+        [Rr])
+            if [[ -e "$orig_path" ]]; then
+                echo -n "${YELLOW}Overwrite? [y/N]: ${RESET}"
+                read -r ov
+                [[ ! "$ov" =~ ^[Yy]$ ]] && return
+            fi
+            mkdir -p "$(dirname "$orig_path")"
+            if mv "$FILES_DIR/$trash_name" "$orig_path"; then
+                rm -f "$INFO_DIR/$trash_name.trashinfo"
+                echo "Restored ${GREEN}'$(basename "$orig_path")'${RESET}."
+            fi
+            ;;
+        [Dd])
+            rm -rf "$FILES_DIR/$trash_name" "$INFO_DIR/$trash_name.trashinfo"
+            echo "Destroyed ${RED}$trash_name${RESET}."
+            ;;
+    esac
+}
+
+find_trash() {
+    local pattern="$1"
+    if [[ -z "$pattern" ]]; then
+        echo "${RED}Usage: ztrash find <pattern>${RESET}" >&2
+        return 1
+    fi
+
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    local found=0
+    for f in $info_files; do
+        local base=$(basename "$f" .trashinfo)
+        local date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
+        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
+        [[ -z "$encoded" ]] && continue
+        local decoded=$(url_decode "$encoded")
+        [[ -z "$decoded" ]] && continue
+        local name=$(basename "$decoded")
+        if [[ "$name" == *$~pattern* || "$decoded" == *$~pattern* ]]; then
+            if [[ $found -eq 0 ]]; then
+                echo "  ${BOLD}${CYAN}Matching${RESET} '${YELLOW}$pattern${RESET}'"
+                echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
+                printf "  ${CYAN}%-17s${RESET}  ${BLUE}%s${RESET}\n" "Binned" "Path"
+                echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
+            fi
+            local term_cols=${COLUMNS:-80}
+            local display_path=$(truncate_path "$decoded" $(( term_cols - 21 )))
+            printf "  ${CYAN}%-17s${RESET}  ${BLUE}%s${RESET}\n" "${date:-Unknown}" "$display_path"
+            ((found++))
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        echo "  ${YELLOW}No items match '$pattern'.${RESET}"
+    else
+        echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
+        echo "  ${CYAN}$found${RESET}${DIM} item(s) found${RESET}"
+    fi
+}
+
+restore_pattern() {
+    local pattern="$1"
+    if [[ -z "$pattern" ]]; then
+        echo "${RED}Usage: ztrash restore <pattern>${RESET}" >&2
+        return 1
+    fi
+
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    local restored=0
+    for f in $info_files; do
+        local base=$(basename "$f" .trashinfo)
+        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
+        [[ -z "$encoded" ]] && continue
+        local decoded=$(url_decode "$encoded")
+        [[ -z "$decoded" ]] && continue
+        local name=$(basename "$decoded")
+        if [[ "$name" == *$~pattern* || "$decoded" == *$~pattern* ]]; then
+            if [[ -e "$decoded" ]]; then
+                local term_cols=${COLUMNS:-80}
+                local disp=$(truncate_path "$decoded" $(( term_cols - 40 )))
+                echo -n "  ${YELLOW}?${RESET} '$disp' exists. Overwrite? [y/N]: ${RESET}"
+                read -r ov
+                [[ ! "$ov" =~ ^[Yy]$ ]] && continue
+            fi
+            local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
+            local fsize=$(format_bytes ${fbytes:-0})
+            mkdir -p "$(dirname "$decoded")"
+            if mv "$FILES_DIR/$base" "$decoded"; then
+                rm -f "$INFO_DIR/$base.trashinfo"
+                echo "  ${GREEN}✓${RESET} Restored '$(basename "$decoded")' (${fsize})"
+                ((restored++))
+            fi
+        fi
+    done
+    if [[ $restored -eq 0 ]]; then
+        echo "  ${YELLOW}No items matched '$pattern'.${RESET}"
+    else
+        echo "  ${GREEN}Restored ${CYAN}$restored${RESET}${GREEN} item(s).${RESET}"
+    fi
+}
+
+interactive_action() {
+    local action="$1"
+    local info_files=("$INFO_DIR"/*.trashinfo(N))
+    if [[ ${#info_files} -eq 0 ]]; then
+        echo "${YELLOW}Nothing to $action.${RESET} The bin is empty."
+        return
+    fi
+
+    local total_items=${#info_files}
+    local i=1 items=() total_bytes=0
+    local action_label="restore"
+    [[ "$action" == "delete" ]] && action_label="permanently delete"
+
+    local term_cols=${COLUMNS:-80}
+
+    echo "  ${BOLD}${CYAN}Select items to $action_label${RESET}"
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
+    printf "${DIM}  %3s  %5s  %-20s  %s${RESET}\n" "  #" "Size" "Name" "Original Path"
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
+
+    for f in $info_files; do
+        local base=$(basename "$f" .trashinfo)
+        local encoded_path=$(grep "^Path=" "$f" | cut -d= -f2-)
+        [[ -z "$encoded_path" ]] && continue
+        local decoded_path=$(url_decode "$encoded_path")
+        [[ -z "$decoded_path" ]] && continue
+        local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
+        fbytes=${fbytes:-0}
+        local fsize=$(format_bytes $fbytes)
+        total_bytes=$(( total_bytes + fbytes ))
+        items+=("$base|$decoded_path")
+        local display_path=$(truncate_path "$decoded_path" $(( term_cols - 36 )))
+        printf "  ${CYAN}%2d)${RESET}  ${YELLOW}%5s${RESET}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" $i "$fsize" "$(basename "$decoded_path")" "$display_path"
+        ((i++))
+    done
+
+    local total_fmt=$(format_bytes $total_bytes)
+    local item_count=$((i - 1))
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
+    echo "  ${CYAN}$item_count${RESET}${DIM} item(s), ${YELLOW}$total_fmt${RESET}${RESET}"
+    echo
+
+    echo -n "${BOLD}${CYAN}Numbers to $action_label${RESET} ${DIM}(e.g. 1 2 5, 1-5, all)${RESET} or '${RED}q${RESET}': "
+    read -r response
+    [[ "$response" == "q" || -z "$response" ]] && return
+
+    response="${response//,/ }"
+    local choices=()
+    for token in $=response; do
+        if [[ "$token" == "all" ]]; then
+            choices=()
+            for n in {1..$item_count}; do choices+=($n); done
+            break
+        elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            for n in $(seq $match[1] $match[2]); do choices+=($n); done
+        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+            choices+=($token)
+        fi
+    done
+
+    for choice in $choices; do
+        if (( choice > 0 && choice < i )); then
+            local mapping=("${(s:|:)items[$choice]}")
+            local trash_name=$mapping[1]
+            local orig_path=$mapping[2]
+
+            if [[ "$action" == "restore" ]]; then
+                if [[ -e "$orig_path" ]]; then
+                    local disp=$(truncate_path "$orig_path" $(( term_cols - 40 )))
+                    echo -n "${YELLOW}'$disp' already exists. Overwrite? [y/N]: ${RESET}"
+                    read -r ov
+                    [[ ! "$ov" =~ ^[Yy]$ ]] && continue
+                fi
+                mkdir -p "$(dirname "$orig_path")"
+                if mv "$FILES_DIR/$trash_name" "$orig_path"; then
+                    rm -f "$INFO_DIR/$trash_name.trashinfo"
+                    echo "  ${GREEN}✓${RESET} Restored '$(basename "$orig_path")'"
+                else
+                    echo "  ${RED}✗${RESET} Failed to restore $trash_name" >&2
+                fi
+            elif [[ "$action" == "delete" ]]; then
+                rm -rf "$FILES_DIR/$trash_name" "$INFO_DIR/$trash_name.trashinfo"
+                echo "  ${RED}✗${RESET} Deleted $trash_name"
+            fi
+        else
+            echo "  ${YELLOW}!${RESET} Invalid choice: $choice"
+        fi
+    done
+}
+
+# --- Main routing logic ---
+
+if [[ $# -eq 0 ]]; then
+    show_help
+    exit 0
+fi
+
+case "$1" in
+    -l|--list)    list_trash ;;
+    -r|--restore) interactive_action "restore" ;;
+    -d|--delete)  interactive_action "delete" ;;
+    -e|--empty)   empty_trash ;;
+    -s|--size)    show_size ;;
+    -u|--undo)    undo_trash ;;
+    -v|--verbose)
+        shift
+        move_to_trash -v "$@"
+        ;;
+    -w|--watch)   watch_trash ;;
+    --fzf)        fzf_action ;;
+    --version)
+        echo "ztrash version $VERSION"
+        exit 0
+        ;;
+    --print-completion)
+        if [[ $# -lt 2 ]]; then
+            echo "${RED}Usage: ztrash --print-completion bash|zsh|fish${RESET}" >&2
+            exit 1
+        fi
+        print_completion "$2"
+        ;;
+    -p|--purge)
+        if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+            echo "${RED}Error: --purge requires a number of days${RESET}" >&2
+            exit 1
+        fi
+        purge_trash "$2"
+        ;;
+    find)
+        shift
+        find_trash "$@"
+        ;;
+    restore)
+        shift
+        restore_pattern "$@"
+        ;;
+    -h|--help)    show_help ;;
+    -*)
+        echo "${RED}Unknown option: $1.${RESET}"
+        show_help
+        exit 1
+        ;;
+    *)
+        move_to_trash "$@"
+        ;;
+esac
