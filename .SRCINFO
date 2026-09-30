@@ -11,6 +11,6 @@ pkgbase = ztrash
 	depends = coreutils
 	optdepends = fzf: fuzzy-find integration with --fzf
 	source = ztrash-1.1.0.tar.gz::https://github.com/AceMinerOjal/ztrash/archive/v1.1.0.tar.gz
-	sha256sums = 0acfca26492c7624f7f1361228f5a58002096708f3a5cad3f7265688ee64bb74
+	sha256sums = fa3045330c20ba8cb8199cbdaacd98e865b2d0ad36805ecaf9c9d0624cbdaa9f
 
 pkgname = ztrash

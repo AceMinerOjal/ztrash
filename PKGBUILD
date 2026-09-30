@@ -11,10 +11,7 @@ depends=('zsh' 'coreutils')
 makedepends=('scdoc')
 optdepends=('fzf: fuzzy-find integration with --fzf')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/AceMinerOjal/ztrash/archive/v$pkgver.tar.gz")
-# The release tarball's own hash cannot be known until this commit is tagged,
-# so it lands in the follow-up commit on main. The AUR builds from the PKGBUILD
-# in the AUR repository, not from this one; SKIP here never ships a package.
-sha256sums=('SKIP')
+sha256sums=('fa3045330c20ba8cb8199cbdaacd98e865b2d0ad36805ecaf9c9d0624cbdaa9f')
 install=ztrash.install
 
 package() {
