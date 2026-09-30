@@ -1,0 +1,63 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # No version matrix on purpose: the distro package is what users run, and
+    # pinning specific zsh releases here would only test a zsh nobody installs.
+    # The suite runs against whatever `apt` provides, on every push.
+    name: zsh on ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh and coreutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh coreutils
+          zsh --version
+
+      - name: Syntax check
+        run: |
+          zsh -n ./ztrash
+          zsh -n ./tests/run.zsh
+          zsh -n ./tests/cases.zsh
+          zsh -n ./completions/ztrash.zsh
+
+      - name: Regression suite
+        run: make check
+
+      - name: Completions are up to date
+        run: make completions-check
+
+      - name: Build the man page
+        run: |
+          sudo apt-get install -y scdoc
+          make man
+
+  lint:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y zsh shellcheck
+
+      - name: shellcheck the bash completion
+        run: shellcheck -s bash ./completions/ztrash.bash
+
+      - name: Check for unquoted expansions that break on spaces
+        run: |
+          # The classic zsh footgun: a local named `path` silently empties $PATH.
+          if grep -nE '^\s*local[^#]*\b(path|PATH|status|options|commands|argv|cdpath|fignore|mailpath|manpath|psvar|module_path|dirstack)\b' ./ztrash; then
+            echo "error: a local shadows a zsh special parameter" >&2
+            exit 1
+          fi
+          echo "  no shadowed zsh specials"

@@ -4,19 +4,33 @@ A polished, FreeDesktop-compliant trash manager with a touch of personality.
 
 ## Features
 
-- **FreeDesktop.org Trash spec** — integrates with GNOME, KDE, XFCE trash
-- **Rich interactive UI** — colored output, numbered menus with ranges
-- **fzf integration** — fuzzy-find items to restore or delete
-- **Live watcher** — real-time trash size display (`-w`)
-- **Undo** — restore the most recently trashed item (`-u`)
-- **Pattern restore** — restore all items matching a glob (`restore "*.bak"`)
-- **Find** — search trashed items by name or path (`find important`)
-- **Purge by age** — permanently delete items older than N days (`-p 30`)
-- **Zero dependencies** — pure zsh (python3 used as optional fallback)
+- **FreeDesktop.org Trash spec**: integrates with GNOME, KDE, and XFCE trash
+- **Correct under pipes**: `ztrash -l | less` shows paths, and filenames
+  containing spaces, `|`, newlines, or non-ASCII characters round-trip exactly
+- **Cross-filesystem support**: files from other mounts go to that
+  filesystem's own topdirectory trash, so moves stay atomic
+- **Rich interactive UI**: coloured output, numbered menus with ranges
+- **fzf integration**: fuzzy-find items to restore or delete
+- **Live watcher**: real-time trash size display (`-w`)
+- **Undo**: restore the most recently trashed item (`-u`)
+- **Pattern restore**: restore all items matching a glob (`restore "*.bak"`)
+- **Find**: search trashed items by name or path (`find important`)
+- **Purge by age**: permanently delete items older than N days (`-p 30`)
+- **Garbage collection**: drop metadata with no payload and vice versa (`--gc`)
+- **Scriptable**: `--json`, `--dry-run`, and `--yes` for unattended use
+- **Pure zsh**: no Python and no external framework, just zsh and coreutils
+
+## Requirements
+
+- `zsh`
+- GNU coreutils: `stat`, `du`, `date`, `mv`, `rm`, `mkdir`, `cp`, `mktemp`,
+  `grep`, `cat`
+- Optional: `fzf` for `--fzf`, `tput` for the terminal width (falls back to 80),
+  `scdoc` to build the man page
 
 ## Installation
 
-### From AUR (recommended for Arch Linux)
+### From AUR (Arch Linux)
 
 ```bash
 yay -S ztrash
@@ -29,33 +43,88 @@ paru -S ztrash
 ```bash
 git clone https://github.com/AceMinerOjal/ztrash.git
 cd ztrash
-sudo install -Dm755 ztrash /usr/local/bin/ztrash
+sudo make install
 ```
+
+That installs into `/usr/local`. Pass `PREFIX=~/.local` to install elsewhere.
+To uninstall: `sudo make uninstall`
 
 ## Usage
 
 ```bash
 ztrash file1.txt file2.txt     # Move files to trash
-ztrash -l                       # List trashed items
-ztrash -r                       # Interactively restore items
-ztrash -d                       # Interactively delete items
-ztrash -e                       # Empty trash
-ztrash -s                       # Show trash size
-ztrash -u                       # Undo last trash
-ztrash -w                       # Watch trash size live
-ztrash -p 30                    # Purge items older than 30 days
-ztrash --fzf                    # Fuzzy-find items with fzf
-ztrash find important           # Search for trashed items
-ztrash restore "*.pdf"          # Restore items matching pattern
+ztrash -l                      # List trashed items
+ztrash -l --json               # Same, as machine-readable JSON
+ztrash -r                      # Interactively restore items
+ztrash -d                      # Interactively delete items
+ztrash -e                      # Empty trash
+ztrash -s                      # Show trash size
+ztrash -u                      # Undo last trash
+ztrash -w                      # Watch trash size live
+ztrash -p 30                   # Purge items older than 30 days
+ztrash --fzf                   # Fuzzy-find items with fzf
+ztrash --gc                    # Remove orphaned trash entries
+ztrash find important          # Search for trashed items
+ztrash restore "*.pdf"         # Restore items matching pattern
+ztrash -p 30 -n                # Preview a purge without doing it
+ztrash -e -y                   # Empty the trash without a prompt
+ztrash restore "*.pdf" -n      # Preview a restore, changing nothing
+ztrash -- --weird-name         # Trash a file whose name starts with a dash
 ```
 
+Options can appear in any order, `-y`, `-n`, and `-v` are also accepted after a
+subcommand, and anything after `--` is treated as a filename.
+
+The exit status is `0` on success, `1` when an operation failed, and `2` for a
+usage error, so scripts can tell the two apart.
+
+## Configuration
+
+Create `~/.config/ztrash/config` to set defaults. It is a shell fragment, so any
+of these work:
+
+```bash
+# How old an item must be before --purge removes it.
+export ZTRASH_PURGE_DAYS=60
+
+# Seconds between refreshes for --watch.
+export ZTRASH_INTERVAL=5
+
+# Use a trash root somewhere other than $XDG_DATA_HOME/Trash.
+export ZTRASH_TRASH_DIR=/mnt/bigdisk/.Trash-1000
+```
+
+`ZTRASH_NO_COLOR` (or `NO_COLOR`) disables colour, `ZTRASH_FORCE_COLOR` keeps it
+when piping, and `ZTRASH_COLS` forces the assumed terminal width. See
+`ztrash --help` or `man ztrash` for the full list.
+
 ## Completion
+
+The completion scripts are generated by ztrash itself, so they always match the
+option parser:
 
 ```bash
 ztrash --print-completion zsh >> ~/.zshrc
 ztrash --print-completion bash >> ~/.bashrc
-ztrash --print-completion fish >> ~/.config/fish/completions/ztrash.fish
+ztrash --print-completion fish > ~/.config/fish/completions/ztrash.fish
 ```
+
+The `make install` target already installs them into the standard locations.
+
+## Development
+
+```bash
+make check              # run the regression suite (pure zsh, no framework)
+make completions        # regenerate completions/ from the script
+make completions-check  # fail if completions/ is stale
+make man                # render the man page with scdoc
+```
+
+Run a single case by passing a substring of its name, for example
+`tests/run.zsh purge` or `tests/run.zsh codec`.
+
+Every case runs the real `ztrash` binary against a throwaway `XDG_DATA_HOME`,
+so the suite never touches your actual trash.
 
 ## License
 

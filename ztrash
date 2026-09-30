@@ -15,715 +15,1353 @@
 # The above copyright notice and this permission notice shall be included in
 # all copies or substantial portions of the Software.
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
-# --- Configuration & Setup ---
-setopt EXTENDED_GLOB NO_UNSET
+# --- Options ---
+setopt EXTENDED_GLOB NO_UNSET NO_ALIASES
+emulate -L zsh
 
-TRASH_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
-FILES_DIR="$TRASH_DIR/files"
-INFO_DIR="$TRASH_DIR/info"
+# Exit codes: 0 success, 1 an operation failed, 2 usage error.
+readonly EXIT_OK=0 EXIT_FAIL=1 EXIT_USAGE=2
 
-mkdir -p "$FILES_DIR" "$INFO_DIR"
+# --- Configuration ---
+# Load ~/.config/ztrash/config if present, then apply environment overrides.
+typeset -g ZTRASH_CONFIG_DIR="${ZDG_CONFIG_HOME:-$HOME/.config}/ztrash"
+[[ -r $ZTRASH_CONFIG_DIR/config ]] && source $ZTRASH_CONFIG_DIR/config
 
-if [[ -t 1 ]]; then
-    BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m'
-    YELLOW=$'\e[33m' BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' RESET=$'\e[0m'
-else
-    BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" RESET=""
-fi
+typeset -g ASSUME_YES=0
+typeset -g DRY_RUN=0
+typeset -g VERBOSE=0
+typeset -g USE_JSON=0
+typeset -g WATCH_INTERVAL="${ZTRASH_INTERVAL:-2}"
+# Default age for --purge when the user does not pass one. ZTRASH_PURGE_DAYS is
+# honoured so the config file can set it once instead of editing a muscle
+# memory.
+typeset -g PURGE_DAYS="${ZTRASH_PURGE_DAYS:-30}"
 
-# --- Helpers ---
+typeset -g TRASH_ROOT="${ZTRASH_TRASH_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/Trash}"
 
-url_decode() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]), end='')" "$1"
-    else
-        local str="$1" decoded=""
-        while [[ -n "$str" ]]; do
-            if [[ "$str" = '%'([0-9a-fA-F][0-9a-fA-F])* ]]; then
-                decoded+="\\x${match[1]}"
-                str="${str#%??}"
-            else
-                decoded+="${str[1]}"
-                str="${str:1}"
-            fi
-        done
-        printf '%b' "$decoded"
+# --- Colours ---
+typeset -g BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" RESET=""
+init_colors() {
+    # NO_COLOR wins, then an explicit force flag, then tty autodetection.
+    if [[ -n ${NO_COLOR-} || -n ${ZTRASH_NO_COLOR-} ]]; then
+        return
+    elif [[ -n ${ZTRASH_FORCE_COLOR-} || -t 1 ]]; then
+        BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m'
+        YELLOW=$'\e[33m' BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' RESET=$'\e[0m'
     fi
 }
 
-url_encode() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]), end='')" "$1"
-    else
-        local str="$1" encoded="" c
-        for (( i = 1; i <= ${#str}; i++ )); do
-            c="$str[i]"
-            case "$c" in
-                [a-zA-Z0-9._~-]) encoded+="$c" ;;
-                *) printf -v hex '%%%02X' "'$c"; encoded+="$hex" ;;
-            esac
-        done
-        printf '%s' "$encoded"
-    fi
+# --- Output helpers ---
+warn() { print -r -- "${RED}Error:${RESET} $*" >&2 }
+note() { print -r -- "  ${YELLOW}!${RESET} $*" }
+ok()   { print -r -- "  ${GREEN}✓${RESET} $*" }
+
+die_usage() {
+    warn "$*"
+    print -r -- "Try '${DIM}ztrash --help${RESET}' for more information." >&2
+    exit $EXIT_USAGE
 }
 
-get_size() {
-    if [[ -e "$1" || -L "$1" ]]; then
-        du -sh "$1" | cut -f1
-    else
-        echo "0B"
+confirm() {
+    # $1 = prompt text, $2 = y|N. Returns 0 on consent.
+    (( ASSUME_YES )) && return 0
+    if [[ ! -t 0 && ! -p /dev/stdin ]]; then
+        warn "refusing to prompt without a terminal; re-run with -y."
+        return 1
     fi
+    local reply=""
+    print -rn -- "$1 "
+    # read returns non-zero when the input ends without a newline, which is not
+    # a reason to throw away what the user typed.
+    read -r reply
+    [[ $reply == [yY] ]]
 }
 
-format_bytes() {
-    local bytes=$1
-    if (( bytes < 1024 )); then
-        printf "%dB\n" "$bytes"
-    elif (( bytes < 1048576 )); then
-        printf "%.1fK\n" "$(( bytes / 1024. ))"
-    elif (( bytes < 1073741824 )); then
-        printf "%.1fM\n" "$(( bytes / 1048576. ))"
-    else
-        printf "%.1fG\n" "$(( bytes / 1073741824. ))"
-    fi
+# --- Terminal geometry ---
+term_width() {
+    # zsh sets COLUMNS=0 when stdout is not a tty, so ${COLUMNS:-80} is not
+    # enough -- 0 has to be treated as "unknown" and probed, then floored so
+    # the path column can never collapse to nothing.
+    local -i w=${ZTRASH_COLS:-${COLUMNS:-0}}
+    (( w > 0 )) || w=$(command tput cols 2>/dev/null) || w=80
+    (( w < 40 )) && w=40
+    print -r -- $w
 }
 
 truncate_path() {
-    local path="$1" max=$2
-    if [[ $max -le 0 ]]; then
-        printf ''
-    elif [[ $max -lt 4 ]]; then
-        printf '%s' "${path:0:$max}"
-    elif [[ ${#path} -gt $max ]]; then
-        local half=$(( (max - 3) / 2 ))
-        local half2=$(( max - 3 - half ))
-        printf '%s' "${path:0:$half}...${path: -$half2}"
+    local p=$1
+    local -i max=$2
+    (( max < 12 )) && max=12
+    if (( ${#p} <= max )); then
+        REPLY=$p
+    elif (( max < 8 )); then
+        REPLY=${p:0:$max}
     else
-        printf '%s' "$path"
+        local -i head=$(( (max - 1) / 2 ))
+        local -i tail=$(( max - 1 - head ))
+        REPLY="${p[1,$head]}…${p[-$tail,-1]}"
     fi
 }
 
-date_to_epoch() {
-    local date_str="$1"
-    local epoch=$(date -d "$date_str" +%s 2>/dev/null)
-    if [[ -z "$epoch" ]] && command -v python3 >/dev/null 2>&1; then
-        epoch=$(python3 -c "
-import sys
-from datetime import datetime
-try:
-    dt = datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%S')
-    print(int(dt.timestamp()), end='')
-except:
-    pass
-" "$date_str" 2>/dev/null)
-    fi
-    echo "$epoch"
+# A horizontal rule sized to the terminal.
+hr() {
+    local -i n=${1:-60}
+    (( n < 1 )) && n=1
+    local pad
+    printf -v pad '%*s' $n ''
+    print -r -- "  ${DIM}${pad// /─}${RESET}"
 }
 
-purge_trash() {
-    local days=$1
-    local cutoff=$(date -d "$days days ago" +%s 2>/dev/null)
-    if [[ -z "$cutoff" ]] && command -v python3 >/dev/null 2>&1; then
-        cutoff=$(python3 -c "from datetime import datetime, timedelta; print(int((datetime.now() - timedelta(days=$days)).timestamp()), end='')" 2>/dev/null)
+# Human-readable size. The result is left in $REPLY rather than printed:
+# callers that want a string need it several hundred times per listing and a
+# $(...) around every one of those is a fork per item.
+format_bytes() {
+    local -i bytes=${1:-0}
+    if (( bytes < 1024 )); then
+        printf -v REPLY '%dB' $bytes
+    elif (( bytes < 1048576 )); then
+        printf -v REPLY '%.1fK' "$(( bytes / 1024.0 ))"
+    elif (( bytes < 1073741824 )); then
+        printf -v REPLY '%.1fM' "$(( bytes / 1048576.0 ))"
+    elif (( bytes < 1099511627776 )); then
+        printf -v REPLY '%.1fG' "$(( bytes / 1073741824.0 ))"
+    else
+        printf -v REPLY '%.1fT' "$(( bytes / 1099511627776.0 ))"
     fi
-    if [[ -z "$cutoff" ]]; then
-        echo "${RED}Error: Cannot compute cutoff date.${RESET}" >&2
+}
+
+# Human date for the current time, used to decide how to render each item.
+typeset -g NOW_STAMP=""
+init_now() { [[ -n $NOW_STAMP ]] || NOW_STAMP=$(date +%Y-%m-%dT%H:%M:%S) }
+
+format_date() {
+    local stamp=$1
+    [[ -z $stamp ]] && { REPLY='Unknown'; return }
+    init_now
+    # Subscripting a zsh scalar is a character *range*, not a start plus count,
+    # so these are inclusive end offsets: 1-10 date, 6-10 month/day, 12-16 time.
+    if [[ ${stamp[1,10]} == ${NOW_STAMP[1,10]} ]]; then
+        REPLY=${stamp[12,16]}
+    elif [[ ${stamp[1,4]} == ${NOW_STAMP[1,4]} ]]; then
+        REPLY="${stamp[6,10]} ${stamp[12,16]}"
+    else
+        REPLY=${stamp[1,10]}
+    fi
+}
+
+# --- URL encoding (RFC 2396 / FreeDesktop Path= format) ---
+# Byte-wise so multi-byte filenames survive intact. No python3, no forks.
+url_encode() {
+    emulate -L zsh
+    setopt LOCAL_OPTIONS EXTENDED_GLOB
+    local LC_ALL=C
+    local str=$1
+    # Fast path: the overwhelmingly common case is a path that needs no
+    # encoding at all, and the byte loop below costs about a millisecond each.
+    if [[ $str != *[^A-Za-z0-9/._~-]* ]]; then
+        print -rn -- $str
+        return 0
+    fi
+    local -a octets
+    octets=(${(s::)str})
+    local out="" c
+    for c in $octets; do
+        case "$c" in
+            [a-zA-Z0-9/._~-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    print -rn -- "$out"
+}
+
+url_decode() {
+    emulate -L zsh
+    setopt LOCAL_OPTIONS EXTENDED_GLOB
+    local LC_ALL=C
+    local str=$1
+    # Fast path: with no escape sequence in the string the byte loop below
+    # cannot change anything, and it costs about a millisecond per path.
+    if [[ $str != *%* ]]; then
+        print -rn -- $str
+        return 0
+    fi
+    local out="" c
+    local -i i
+    for (( i = 1; i <= ${#str}; i++ )); do
+        c=$str[i]
+        if [[ $c == '%' && $str[i+1,i+2] == [0-9a-fA-F][0-9a-fA-F] ]]; then
+            printf -v c "\x$str[i+1,i+2]"
+            out+=$c
+            (( i += 2 ))
+        else
+            out+=$c
+        fi
+    done
+    print -rn -- "$out"
+}
+
+# --- Bin discovery -------------------------------------------------------
+# The FreeDesktop spec allows a per-filesystem trash at <topdir>/.Trash-$uid or
+# <topdir>/.Trash/$uid. Using it matters: it keeps trashing a file on another
+# mount a cheap rename instead of a full cross-device copy, and it keeps
+# restores anchored to the right mount after a remount.
+
+file_device() { stat -c '%d' -- "$1" 2>/dev/null }
+
+mount_point_of() {
+    local mp
+    mp=$(stat -c '%m' -- "$1" 2>/dev/null)
+    if [[ -n $mp && $mp != / ]]; then
+        print -r -- "$mp"
+        return 0
+    fi
+    # Fallback: longest prefix match against /proc/mounts.
+    local -a entries
+    local line best="" mnt
+    local -i bestlen=0
+    while IFS= read -r line; do
+        mnt=${line#* }
+        mnt=${mnt%% *}
+        [[ $mnt == / ]] && continue
+        if [[ $1 == $mnt(|/*) ]]; then
+            if (( ${#mnt} > bestlen )); then
+                bestlen=${#mnt}
+                best=$mnt
+            fi
+        fi
+    done < /proc/mounts 2>/dev/null
+    print -r -- "${best:-/}"
+}
+
+# Decide which bin $1 belongs in. Sets ZTRASH_BIN, ZTRASH_BIN_TOPDIR (empty
+# for the home bin) and ZTRASH_BIN_RELATIVE (1 when Path= must be stored
+# relative to the topdir).
+resolve_bin() {
+    local target=$1
+    ZTRASH_BIN=$TRASH_ROOT
+    ZTRASH_BIN_TOPDIR=""
+    ZTRASH_BIN_RELATIVE=0
+    ZTRASH_BIN_FALLBACK=0
+
+    local -i dev_target dev_home
+    dev_target=$(file_device "$target") || return 0
+    dev_home=$(file_device "$TRASH_ROOT") || dev_home=$dev_target
+
+    (( dev_target == dev_home )) && return 0
+
+    local topdir
+    topdir=$(mount_point_of "$target")
+    [[ -z $topdir || $topdir == / ]] && return 0
+
+    local -i uid=${EUID:-$(id -u)}
+    local cand=$topdir/.Trash-$uid
+    if [[ -d $cand ]] || [[ -w $topdir ]]; then
+        if mkdir -p -- "$cand/files" "$cand/info" 2>/dev/null; then
+            ZTRASH_BIN=$cand
+            ZTRASH_BIN_TOPDIR=$topdir
+            ZTRASH_BIN_RELATIVE=1
+            return 0
+        fi
+    fi
+
+    cand=$topdir/.Trash/$uid
+    if [[ -d $topdir/.Trash ]] && [[ -k $topdir/.Trash ]] && [[ -w $topdir/.Trash ]]; then
+        if mkdir -p -- "$cand/files" "$cand/info" 2>/dev/null; then
+            ZTRASH_BIN=$cand
+            ZTRASH_BIN_TOPDIR=$topdir
+            ZTRASH_BIN_RELATIVE=1
+            return 0
+        fi
+    fi
+
+    # Not writable: fall back to the home bin, but say so.
+    ZTRASH_BIN_FALLBACK=1
+    return 0
+}
+
+# --- Item model ---
+# The trash is walked once into parallel arrays. A pipe-delimited record
+# format was tried and is not safe: '|' is a legal filename byte.
+typeset -ga IT_BASE IT_BIN IT_PATH IT_DATE IT_SIZE IT_GOOD
+
+load_items() {
+    IT_BASE=() IT_BIN=() IT_PATH=() IT_DATE=() IT_SIZE=() IT_GOOD=()
+    local -a infos
+    infos=("$TRASH_ROOT/info"/*.trashinfo(N))
+    (( ${#infos} )) || return 0
+
+    local f line
+    local topdir=${TRASH_ROOT:h}
+    for f in $infos; do
+        local base=${f:t:r}
+        # `path` is a special zsh parameter tied to $PATH -- never use it here.
+        local encpath="" stamp=""
+        while IFS= read -r line; do
+            case $line in
+                Path=*)         encpath=${line#Path=} ;;
+                DeletionDate=*) stamp=${line#DeletionDate=} ;;
+            esac
+        done < $f
+        [[ -z $encpath ]] && continue
+        local decoded=""
+        decoded=$(url_decode "$encpath")
+        [[ -z $decoded ]] && continue
+        # A relative Path= is the spec's form for a topdir trash and is only
+        # meaningful relative to the directory holding the bin.
+        [[ $decoded != /* ]] && decoded=$topdir/$decoded
+        IT_BASE+=("$base")
+        IT_BIN+=("$TRASH_ROOT")
+        IT_PATH+=("$decoded")
+        IT_DATE+=("$stamp")
+        IT_SIZE+=(0)
+        IT_GOOD+=("$([[ -e $TRASH_ROOT/files/$base || -L $TRASH_ROOT/files/$base ]] && print 1 || print 0)")
+    done
+
+    size_items
+    sort_items_by_date_desc
+}
+
+# One du for the whole trash instead of one per item.
+typeset -g DU_BATCH=0
+detect_du_batch() {
+    du --help 2>&1 | grep -q -- '--files0-from' && DU_BATCH=1
+}
+
+size_items() {
+    (( ${#IT_BASE} )) || return 0
+    local -i i
+    local -a existing
+    existing=()
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        local p=$IT_BIN[i]/files/$IT_BASE[i]
+        if [[ -e $p || -L $p ]]; then
+            existing+=($p)
+        else
+            IT_SIZE[i]=0
+        fi
+    done
+    (( ${#existing} )) || return 0
+
+    if (( DU_BATCH )); then
+        local -A sizes
+        local listfile
+        listfile=$(mktemp "${TMPDIR:-/tmp}/ztrash.du.XXXXXX") || return 0
+        # `p` stays local from the loop above. Re-declaring a local inside a
+        # loop makes zsh echo its old value, which corrupts the output.
+        for p in $existing; do print -N -- $p >> $listfile; done
+        # Split into a local first: zsh does not apply the ## / %% operators
+        # to an expansion written inside a subscript, so doing it inline
+        # silently stores the whole line as the key and every lookup misses.
+        local line sz key
+        while IFS= read -r line; do
+            [[ -z $line ]] && continue
+            sz=${line%%$'\t'*}
+            key=${line#*$'\t'}
+            sizes[$key]=$sz
+        done < <(du -sb --files0-from=$listfile 2>/dev/null)
+        rm -f -- $listfile
+        for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+            p=$IT_BIN[i]/files/$IT_BASE[i]
+            if [[ -n ${sizes[$p]-} ]]; then
+                IT_SIZE[i]=${sizes[$p]}
+            fi
+        done
+    else
+        for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+            p=$IT_BIN[i]/files/$IT_BASE[i]
+            [[ -e $p || -L $p ]] || continue
+            IT_SIZE[i]=$(du -sb -- $p 2>/dev/null) || IT_SIZE[i]=0
+            IT_SIZE[i]=${IT_SIZE[i]%%$'\t'*}
+        done
+    fi
+}
+
+sort_items_by_date_desc() {
+    local -i i
+    typeset -i n=${#IT_BASE}
+    (( n < 2 )) && return 0
+    # Newest first. The permutation is worked out on "date<TAB>index" records
+    # sorted by zsh itself: a hand-written insertion sort is O(n^2) and becomes
+    # a visible stall once a trash holds a few hundred items. The zero-padded
+    # index keeps items trashed in the same second in their original order, and
+    # the arrays are permuted once at the end instead of on every comparison.
+    local -a recs
+    recs=()
+    local -i pad
+    for (( i = 1; i <= n; i++ )); do
+        # printf -v rather than $(printf ...): a command substitution here is a
+        # fork per item, which is most of the cost of listing a large trash.
+        printf -v pad '%08d' $i
+        recs+=("$IT_DATE[i]"$'\t'"$pad")
+    done
+    recs=(${(o)recs})
+    # Descending: zsh has no combined sort-and-reverse flag, and an explicit
+    # `$recs[n,1]` range is empty rather than reversed, so walk the sorted
+    # records backwards. That also puts the most recently binned item first
+    # when several share a timestamp, which is what -u and the picker want.
+    local -a new_date new_base new_bin new_path new_size new_good
+    new_date=(); new_base=(); new_bin=(); new_path=(); new_size=(); new_good=()
+    local rec idx
+    for (( i = n; i >= 1; i-- )); do
+        rec=${recs[i]}
+        idx=$(( 10#${rec##*$'\t'} ))
+        new_date+=("$IT_DATE[idx]")
+        new_base+=("$IT_BASE[idx]")
+        new_bin+=("$IT_BIN[idx]")
+        new_path+=("$IT_PATH[idx]")
+        new_size+=("$IT_SIZE[idx]")
+        new_good+=("$IT_GOOD[idx]")
+    done
+    IT_DATE=("${new_date[@]}")
+    IT_BASE=("${new_base[@]}")
+    IT_BIN=("${new_bin[@]}")
+    IT_PATH=("${new_path[@]}")
+    IT_SIZE=("${new_size[@]}")
+    IT_GOOD=("${new_good[@]}")
+}
+
+total_bytes() {
+    local -i t=0 i
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do (( t += IT_SIZE[i] )); done
+    print -r -- $t
+}
+
+# --- Core operations -------------------------------------------------------
+
+# Move $1 into a bin, honouring the spec's per-filesystem layout.
+trash_one() {
+    local target=$1
+    local abs
+    # -s keeps symlinks unexpanded; a trashed link must stay the link.
+    abs=$(realpath -s -- "$target") || abs=$target
+
+    if [[ $abs == ${TRASH_ROOT}* ]]; then
+        warn "'$target' is already inside the trash; refusing."
         return 1
     fi
 
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    local count=0 freed_bytes=0
-    for f in $info_files; do
-        local del_date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
-        if [[ -n "$del_date" ]]; then
-            local del_epoch=$(date_to_epoch "$del_date")
-            if [[ -n "$del_epoch" && "$del_epoch" -lt "$cutoff" ]]; then
-                local base=$(basename "$f" .trashinfo)
-                local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
-                freed_bytes=$(( freed_bytes + ${fbytes:-0} ))
-                rm -rf "$FILES_DIR/$base" "$INFO_DIR/$base.trashinfo"
-                ((count++))
+    resolve_bin "$abs"
+    local -i rel=$ZTRASH_BIN_RELATIVE
+    local topdir=$ZTRASH_BIN_TOPDIR
+    local bin=$ZTRASH_BIN
+
+    if (( rel )); then
+        abs=${abs#$topdir/}
+    fi
+    if (( ZTRASH_BIN_FALLBACK )); then
+        note "'$target' is on another filesystem that is not writable; using the home trash."
+    fi
+
+    local base=${abs:t}
+    local -i tries=0
+    local unique
+    while :; do
+        unique="${base}_${$}_${RANDOM}"
+        (( tries++ ))
+        [[ -e $bin/files/$unique || -e $bin/info/$unique.trashinfo ]] || break
+        (( tries < 100 )) || { warn "could not find a free name for '$target'"; return 1; }
+    done
+
+    if (( DRY_RUN )); then
+        ok "would bin '$base'"
+        return 0
+    fi
+
+    # Prefer a rename; fall back to copy+unlink across filesystems.
+    if ! mv -n -- "$target" "$bin/files/$unique" 2>/dev/null; then
+        if ! cp -a -- "$target" "$bin/files/$unique" 2>/dev/null; then
+            rm -rf -- "$bin/files/$unique"
+            warn "failed to move '$target' to the trash."
+            return 1
+        fi
+        rm -rf -- "$target"
+    fi
+
+    mkdir -p -- "$bin/info" || return 1
+    {
+        print -r -- "[Trash Info]"
+        print -r -- "Path=$(url_encode "$abs")"
+        print -r -- "DeletionDate=$(date +%Y-%m-%dT%H:%M:%S)"
+    } > "$bin/info/$unique.trashinfo" || {
+        rm -rf -- "$bin/files/$unique"
+        warn "failed to write trash metadata for '$target'."
+        return 1
+    }
+
+    (( VERBOSE )) && ok "binned '${CYAN}${base}${RESET}'${DIM} (${bin})${RESET}"
+    return 0
+}
+
+# Restore one item. $1 = index into the IT_* arrays.
+restore_one() {
+    local -i idx=$1
+    local base=$IT_BASE[idx] bin=$IT_BIN[idx] orig=$IT_PATH[idx]
+    local payload=$bin/files/$base
+
+    if [[ ! -e $payload && ! -L $payload ]]; then
+        warn "payload for '${orig:t}' is missing; skipping."
+        return 1
+    fi
+
+    if [[ -e $orig || -L $orig ]]; then
+        local tw; truncate_path "$orig" $(( $(term_width) - 40 )); tw=$REPLY
+        if ! confirm "${YELLOW}'$tw' already exists. Overwrite? [${YELLOW}y${RESET}/${DIM}N${RESET}]"; then
+            note "skipped '${orig:t}'."
+            return 1
+        fi
+    fi
+
+    if (( DRY_RUN )); then
+        ok "would restore '${orig:t}'"
+        return 0
+    fi
+
+    local backup=""
+    if [[ -e $orig || -L $orig ]]; then
+        # Stage the existing target aside so a failed restore can roll back
+        # and so a directory never gets nested inside another one.
+        backup="$orig.ztrash-replaced.$$"
+        rm -rf -- "$backup" 2>/dev/null
+        if ! mv -T -- "$orig" "$backup" 2>/dev/null; then
+            warn "could not replace '$orig'."
+            return 1
+        fi
+    fi
+
+    mkdir -p -- "${orig:h}" 2>/dev/null
+    if ! mv -T -- "$payload" "$orig" 2>/dev/null; then
+        [[ -n $backup ]] && mv -T -- "$backup" "$orig" 2>/dev/null
+        warn "failed to restore '$orig'."
+        return 1
+    fi
+
+    rm -f -- "$bin/info/$base.trashinfo"
+    [[ -n $backup ]] && rm -rf -- "$backup"
+    format_bytes $IT_SIZE[idx]
+    ok "restored '${GREEN}${orig:t}${RESET}' (${YELLOW}$REPLY${RESET})"
+    return 0
+}
+
+# Permanently remove one item. $1 = index into the IT_* arrays.
+delete_one() {
+    local -i idx=$1
+    local base=$IT_BASE[idx] bin=$IT_BIN[idx] orig=$IT_PATH[idx]
+
+    if (( DRY_RUN )); then
+        format_bytes $IT_SIZE[idx]
+        ok "would delete '${orig:t}' (${YELLOW}$REPLY${RESET})"
+        return 0
+    fi
+
+    rm -rf -- "$bin/files/$base" || { warn "could not delete '$orig'."; return 1 }
+    rm -f -- "$bin/info/$base.trashinfo"
+    ok "deleted '${RED}${orig:t}${RESET}'"
+    return 0
+}
+
+# --- JSON ------------------------------------------------------------------
+
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\e'/\\e}
+    REPLY=$s
+}
+
+emit_json() {
+    local -i i
+    local -i total
+    total=$(total_bytes)
+    # NB: never a local named `path`; it is tied to $PATH in zsh.
+    local name orig size date bin present
+    json_escape "$TRASH_ROOT"; local trash=$REPLY
+    print -r -- "{"
+    print -r -- "  \"version\": \"$VERSION\","
+    print -r -- "  \"trash\": \"$trash\","
+    print -r -- "  \"count\": ${#IT_BASE},"
+    print -r -- "  \"total_bytes\": $total,"
+    print -r -- "  \"items\": ["
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        local sep=","
+        (( i == ${#IT_BASE} )) && sep=""
+        json_escape "${IT_PATH[i]:t}"; name=$REPLY
+        json_escape "$IT_PATH[i]"; orig=$REPLY
+        format_bytes $IT_SIZE[i]; size=$REPLY
+        json_escape "$IT_DATE[i]"; date=$REPLY
+        json_escape "$IT_BIN[i]"; bin=$REPLY
+        present=false; [[ $IT_GOOD[i] == 1 ]] && present=true
+        print -r -- "    {"
+        print -r -- "      \"name\": \"$name\","
+        print -r -- "      \"path\": \"$orig\","
+        print -r -- "      \"size_bytes\": $IT_SIZE[i],"
+        print -r -- "      \"size\": \"$size\","
+        print -r -- "      \"deletion_date\": \"$date\","
+        print -r -- "      \"present\": $present,"
+        print -r -- "      \"bin\": \"$bin\""
+        print -r -- "    }$sep"
+    done
+    print -r -- "  ]"
+    print -r -- "}"
+}
+
+# --- Actions ---------------------------------------------------------------
+
+list_trash() {
+    load_items
+    if (( USE_JSON )); then
+        emit_json
+        return 0
+    fi
+    if (( ! ${#IT_BASE} )); then
+        print -r -- "${GREEN}Trash is empty.${RESET}"
+        return 0
+    fi
+
+    local -i total
+    total=$(total_bytes)
+    local -i w
+    w=$(term_width)
+    local -i pathcol=$(( w - 26 ))
+    # Below this a truncated path is useless, so stack the path on its own line
+    # instead of mangling it.
+    local -i stacked=0
+    if (( pathcol < 34 )); then
+        stacked=1
+    else
+        (( pathcol > w - 4 )) && pathcol=$(( w - 4 ))
+    fi
+    local -i wl=$(( w - 2 ))
+    local rule
+    rule=$(hr $wl)
+
+    local -i i
+    local -i missing=0
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        (( IT_GOOD[i] )) || (( missing++ ))
+    done
+
+    format_bytes $total
+    print -r -- "  ${BOLD}${CYAN}Trash${RESET} ${DIM}(${YELLOW}${#IT_BASE}${RESET}${DIM} item(s), ${YELLOW}$REPLY${RESET}${DIM})${RESET}"
+    (( missing )) && print -r -- "  ${DIM}${missing} of those have no payload on disk${RESET}"
+    print -r -- $rule
+    if (( stacked )); then
+        print -r -- "  ${CYAN}$(printf '%-17s' 'Binned')  ${YELLOW}$(printf '%5s' 'Size')${RESET}"
+    else
+        print -r -- "  ${CYAN}$(printf '%-17s' 'Binned')  ${YELLOW}$(printf '%5s' 'Size')  ${BLUE}Path${RESET}"
+    fi
+    print -r -- $rule
+
+    # NB: never use `path` as a local name; it is tied to $PATH in zsh.
+    local stamp sz full shown
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        format_date "$IT_DATE[i]"; stamp=$REPLY
+        format_bytes $IT_SIZE[i]; sz=$REPLY
+        truncate_path "$IT_PATH[i]" $pathcol; shown=$REPLY
+        full=$IT_PATH[i]
+        [[ $IT_GOOD[i] != 1 ]] && full="${RED}${full}${RESET} ${DIM}(missing)${RESET}"
+        if (( i % 2 == 0 )); then
+            if (( stacked )); then
+                printf "  ${DIM}${CYAN}%-17s  ${YELLOW}%5s${RESET}\n        %s\n" "$stamp" "$sz" "$full"
+            else
+                printf "  ${DIM}${CYAN}%-17s  ${YELLOW}%5s  %s${RESET}\n" "$stamp" "$sz" "$shown"
+            fi
+        else
+            if (( stacked )); then
+                printf "  ${CYAN}%-17s  ${YELLOW}%5s\n        %s\n" "$stamp" "$sz" "$full"
+            else
+                printf "  ${CYAN}%-17s  ${YELLOW}%5s  %s\n" "$stamp" "$sz" "$shown"
             fi
         fi
     done
-    local freed_fmt=$(format_bytes $freed_bytes)
-    echo "${CYAN}Purged${RESET} ${RED}${BOLD}$count${RESET} item(s) (${YELLOW}$freed_fmt${RESET}) older than ${MAGENTA}$days${RESET} day(s)."
+
+    format_bytes $total
+    print -r -- $rule
+    if (( stacked )); then
+        printf "  %-17s  ${BOLD}${YELLOW}%5s${RESET}\n" "" "$REPLY"
+    else
+        printf "  %-17s  ${BOLD}${YELLOW}%5s  ${BOLD}${BLUE}%s${RESET}\n" "" "$REPLY" "Total"
+    fi
 }
 
+show_size() {
+    load_items
+    if (( USE_JSON )); then
+        emit_json
+        return 0
+    fi
+    local -i total
+    total=$(total_bytes)
+    format_bytes $total
+    print -r -- "Trash size: ${BOLD}${YELLOW}$REPLY${RESET} ${DIM}(${CYAN}${#IT_BASE}${RESET}${DIM} item(s))${RESET}"
+}
+
+# Purge entries older than $1 days. Compares ISO strings: the format is
+# fixed-width and lexicographically ordered, so no date(1) call is needed.
+purge_trash() {
+    local -i days=$1
+    # The comparison is inclusive, so `--purge 0` means "purge everything that is
+    # in the trash right now" instead of "purge things deleted in an earlier
+    # second". Dry runs use the same cutoff so both report identically.
+    local -i now_epoch cutoff_epoch
+    now_epoch=$(date +%s 2>/dev/null) || { warn "cannot compute a cutoff date."; return 1; }
+    cutoff_epoch=$(( now_epoch - days * 86400 ))
+    local cutoff
+    cutoff=$(date -d "@$cutoff_epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || cutoff=$NOW_STAMP
+    [[ -z $cutoff ]] && { warn "cannot compute a cutoff date."; return 1; }
+
+    load_items
+    local -i i purged=0
+    local -i freed=0
+    local -a victims=()
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        local d=$IT_DATE[i]
+        [[ -z $d ]] && continue
+        # zsh's [[ ]] has no <= operator, so spell it out.
+        if [[ $d < $cutoff || $d == $cutoff ]]; then
+            victims+=($i)
+            (( freed += IT_SIZE[i] ))
+            (( purged++ ))
+        fi
+    done
+
+    if (( DRY_RUN )); then
+        format_bytes $freed
+        print -r -- "  ${CYAN}Would purge${RESET} ${BOLD}$purged${RESET} item(s) (${YELLOW}$REPLY${RESET}) older than ${MAGENTA}$days${RESET} day(s)."
+        (( purged )) || return 0
+        for i in $victims; do
+            print -r -- "    ${DIM}${IT_PATH[i]}${RESET}"
+        done
+        return 0
+    fi
+
+    for i in $victims; do
+        delete_one $i
+    done
+    format_bytes $freed
+    print -r -- "  ${CYAN}Purged${RESET} ${BOLD}$purged${RESET} item(s) (${YELLOW}$REPLY${RESET}) older than ${MAGENTA}$days${RESET} day(s)."
+}
+
+empty_trash() {
+    load_items
+    if (( ! ${#IT_BASE} )); then
+        print -r -- "${GREEN}Trash is already empty.${RESET}"
+        return 0
+    fi
+    local -i total
+    total=$(total_bytes)
+    format_bytes $total
+    if ! confirm "${RED}${BOLD}Really empty the trash?${RESET} ${YELLOW}${#IT_BASE}${RESET} item(s), ${BOLD}${YELLOW}$REPLY${RESET}. [${RED}y${RESET}/${DIM}N${RESET}]"; then
+        print -r -- "${YELLOW}Aborted.${RESET} Trash not emptied."
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        local -i i
+        for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+            ok "would delete '${IT_PATH[i]:t}'"
+        done
+        print -r -- "  ${CYAN}Would have emptied${RESET} ${BOLD}${#IT_BASE}${RESET} item(s)."
+        return 0
+    fi
+    local -i i
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        rm -rf -- "$TRASH_ROOT/files/$IT_BASE[i]"
+        rm -f -- "$TRASH_ROOT/info/$IT_BASE[i].trashinfo"
+    done
+    format_bytes $total
+    print -r -- "  ${GREEN}${BOLD}Trash emptied.${RESET} ${YELLOW}$REPLY${RESET} freed."
+    return 0
+}
+
+undo_trash() {
+    load_items
+    if (( ! ${#IT_BASE} )); then
+        print -r -- "${YELLOW}Nothing to undo.${RESET} The bin is empty."
+        return 0
+    fi
+    restore_one 1
+}
+
+# Shared numbered menu for restore and delete.
+interactive_action() {
+    local action=$1
+    local -a cands
+    cands=()
+    load_items
+    local -i i
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        cands+=($i)
+    done
+    if (( ! ${#cands} )); then
+        print -r -- "${YELLOW}Nothing to $action.${RESET} The bin is empty."
+        return 0
+    fi
+
+    local -i w
+    w=$(term_width)
+    local -i wl=$(( w - 2 ))
+    local rule
+    rule=$(hr $wl)
+
+    local verb="restore"
+    [[ $action == delete ]] && verb="permanently delete"
+    print -r -- "  ${BOLD}${CYAN}Select items to $verb${RESET}"
+    print -r -- $rule
+    printf "  ${DIM}%3s  %5s  %-20s  %s${RESET}\n" "#" "Size" "Name" "Original Path"
+    print -r -- $rule
+
+    local -i shown=0 total=0
+    for i in $cands; do
+        local -i num=$(( ++shown ))
+        # The original path is the whole point of the picker, so it is never
+        # truncated; a long path simply soft-wraps.
+        local disp=$IT_PATH[i]
+        [[ $IT_GOOD[i] != 1 ]] && disp="${RED}${disp}${RESET} ${DIM}(missing)${RESET}"
+        format_bytes $IT_SIZE[i]
+        printf "  ${CYAN}%2d)${RESET}  ${YELLOW}%5s${RESET}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" \
+            "$num" "$REPLY" "${IT_PATH[i]:t}" "$disp"
+        (( total += IT_SIZE[i] ))
+    done
+
+    print -r -- $rule
+    format_bytes $total
+    print -r -- "  ${CYAN}$shown${RESET}${DIM} item(s), ${YELLOW}$REPLY${RESET}${RESET}"
+    print -r -- ""
+
+    print -rn -- "${BOLD}${CYAN}Numbers to $verb${RESET} ${DIM}(e.g. 1 2 5, 1-5, all)${RESET} or '${RED}q${RESET}': "
+    local response=""
+    read -r response
+    [[ -z $response || $response == q ]] && return 0
+
+    response="${response//,/ }"
+    local -a choices
+    choices=()
+    local token
+    local -i n
+    for token in ${=response}; do
+        if [[ $token == all ]]; then
+            choices=()
+            for (( n = 1; n <= shown; n++ )); do choices+=($n); done
+            break
+        elif [[ $token == <->-<-> ]]; then
+            for (( n = ${token%%-*}; n <= ${token##*-}; n++ )); do choices+=($n); done
+        elif [[ $token == <-> ]]; then
+            choices+=($token)
+        fi
+    done
+
+    local -i rc=0
+    local idx
+    for n in $choices; do
+        if (( n < 1 || n > shown )); then
+            note "Invalid choice: $n"
+            rc=1
+            continue
+        fi
+        idx=$cands[n]
+        if [[ $action == restore ]]; then
+            restore_one $idx || rc=1
+        else
+            delete_one $idx || rc=1
+        fi
+    done
+    return $rc
+}
+
+fzf_action() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        warn "fzf is not installed. Install it with your package manager."
+        return 1
+    fi
+    if [[ ! -t 0 && ! -p /dev/stdin ]]; then
+        warn "--fzf needs an interactive terminal."
+        return $EXIT_USAGE
+    fi
+    load_items
+    if (( ! ${#IT_BASE} )); then
+        print -r -- "${GREEN}The bin is empty.${RESET}"
+        return 0
+    fi
+
+    local -a input
+    input=()
+    local -i i
+    local stamp sz
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        format_date "$IT_DATE[i]"; stamp=$REPLY
+        format_bytes $IT_SIZE[i]; printf -v sz '%6s' $REPLY
+        input+=("${IT_BASE[i]}"$'\x1f'$stamp$sz$'\x1f'${IT_PATH[i]})
+    done
+
+    local choice
+    # NB: print, not print -l by accident -- `print -r a b` joins its arguments
+    # with a space, which would hand fzf a single line containing every item.
+    choice=$(print -rl -- "${input[@]}" | fzf --reverse --prompt='Select item: ' \
+        --delimiter=$'\x1f' --with-nth=2.. --print0 2>/dev/null) || return 0
+    [[ -z $choice ]] && return 0
+
+    local base=${choice%%$'\x1f'*}
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        if [[ $IT_BASE[i] == $base ]]; then
+            print -r -- "${CYAN}Selected:${RESET} ${BOLD}${IT_PATH[i]:t}${RESET}"
+            print -rn -- "${BOLD}${GREEN}(R)estore${RESET} or ${BOLD}${RED}(D)elete${RESET}? [${GREEN}r${RESET}/${RED}D${RESET}/${DIM}q${RESET}]: "
+            local answer
+            read -r answer
+            case $answer in
+                [Rr]) restore_one $i ;;
+                [Dd]) delete_one $i ;;
+                *)    return 0 ;;
+            esac
+            return
+        fi
+    done
+    warn "could not locate the selected item."
+    return 1
+}
+
+# Glob match for the find/restore subcommands. EXTENDED_GLOB is suspended so
+# that (, | and ^ in a search term are ordinary characters, not operators.
+glob_match() {
+    # $1 basename, $2 user pattern, $3 full path. The pattern may match anywhere
+    # in the name, so `*.bak` and `bak` both work.
+    emulate -L zsh
+    setopt LOCAL_OPTIONS NO_EXTENDED_GLOB
+    # zsh reads a bare `|` as pattern alternation even without extended glob,
+    # which would break patterns for filenames such as `we|ird.txt`. Escape it
+    # so it is matched literally; everything else stays a normal glob.
+    local pat=${2//|/\\|}
+    # A malformed glob (say an unbalanced `[`) makes zsh print "bad pattern" and
+    # abort the match; swallow it and report a plain non-match instead.
+    { [[ $1 == *${~pat}* || $3 == *${~pat}* ]] } 2>/dev/null
+}
+
+find_trash() {
+    local pattern=$1
+    [[ -z $pattern ]] && die_usage "ztrash find requires a pattern"
+    load_items
+
+    local -i w
+    w=$(term_width)
+    local -i pathcol=$(( w - 21 ))
+    (( pathcol < 12 )) && pathcol=12
+
+    local -i found=0 i
+    local -a hits
+    hits=()
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        if glob_match "${IT_PATH[i]:t}" "$pattern" "$IT_PATH[i]"; then
+            hits+=($i)
+            (( found++ ))
+        fi
+    done
+
+    if (( ! found )); then
+        print -r -- "  ${YELLOW}No items match '$pattern'.${RESET}"
+        return 1
+    fi
+
+    local -i wl=$(( w - 2 ))
+    local rule
+    rule=$(hr $wl)
+    print -r -- "  ${BOLD}${CYAN}Matching${RESET} '${YELLOW}$pattern${RESET}'"
+    print -r -- $rule
+    printf "  ${CYAN}%-17s  ${BLUE}%s${RESET}\n" "Binned" "Path"
+    print -r -- $rule
+    for i in $hits; do
+        format_date "$IT_DATE[i]"; local stamp=$REPLY
+        truncate_path "$IT_PATH[i]" $pathcol; local shown=$REPLY
+        printf "  ${CYAN}%-17s  ${BLUE}%s${RESET}\n" "$stamp" "$shown"
+    done
+    print -r -- $rule
+    print -r -- "  ${CYAN}$found${RESET}${DIM} item(s) found${RESET}"
+    return 0
+}
+
+restore_pattern() {
+    local pattern=$1
+    [[ -z $pattern ]] && die_usage "ztrash restore requires a pattern"
+    load_items
+
+    local -a hits
+    hits=()
+    local -i i rc=0
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        if glob_match "${IT_PATH[i]:t}" "$pattern" "$IT_PATH[i]"; then
+            hits+=($i)
+        fi
+    done
+    if (( ! ${#hits} )); then
+        print -r -- "  ${YELLOW}No items matched '$pattern'.${RESET}"
+        return 1
+    fi
+    local -i restored=0
+    for i in $hits; do
+        restore_one $i || rc=1
+        (( restored++ ))
+    done
+    print -r -- "  ${GREEN}Restored ${CYAN}$restored${RESET}${GREEN} item(s).${RESET}"
+    return $rc
+}
+
+# Remove trashinfo files with no payload and payloads with no trashinfo.
+gc_trash() {
+    load_items
+    local -i i removed=0
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        if [[ $IT_GOOD[i] != 1 ]]; then
+            if (( DRY_RUN )); then
+                print -r -- "  ${YELLOW}would remove${RESET} stale metadata ${DIM}${IT_BIN[i]}/info/${IT_BASE[i]}.trashinfo${RESET}"
+            else
+                rm -f -- "$IT_BIN[i]/info/$IT_BASE[i].trashinfo"
+                print -r -- "  ${GREEN}✓${RESET} removed stale metadata for ${DIM}${IT_PATH[i]}${RESET}"
+            fi
+            (( removed++ ))
+        fi
+    done
+
+    # Payloads with no metadata at all.
+    local -A tracked
+    local tp
+    for (( i = 1; i <= ${#IT_BASE}; i++ )); do
+        tp=$IT_BIN[i]/files/$IT_BASE[i]
+        tracked[$tp]=1
+    done
+    local -a orphans
+    for p in "$TRASH_ROOT/files"/*(DN); do
+        [[ -z ${tracked[$p]-} ]] && orphans+=($p)
+    done
+    local orphan
+    for orphan in $orphans; do
+        if (( DRY_RUN )); then
+            print -r -- "  ${YELLOW}would remove${RESET} untracked ${DIM}${orphan}${RESET}"
+        else
+            rm -rf -- "$orphan"
+            print -r -- "  ${GREEN}✓${RESET} removed untracked ${DIM}${orphan}${RESET}"
+        fi
+        (( removed++ ))
+    done
+
+    if (( ! removed )); then
+        print -r -- "  ${GREEN}Trash is tidy.${RESET} Nothing to collect."
+    else
+        local noun="entries"
+        (( removed == 1 )) && noun="entry"
+        print -r -- "  ${CYAN}Collected ${BOLD}$removed${RESET} stale $noun${RESET}."
+    fi
+    return 0
+}
+
+watch_trash() {
+    if [[ ! -t 1 ]]; then
+        warn "-w needs an interactive terminal."
+        return $EXIT_USAGE
+    fi
+    local prev=""
+    while :; do
+        load_items
+        local -i total
+        total=$(total_bytes)
+        format_bytes $total
+        local line="Trash: ${BOLD}${YELLOW}$REPLY${RESET} ${DIM}(${#IT_BASE} item(s))${RESET}"
+        if [[ $line != $prev ]]; then
+            print -r -- $'\e[H\e[2J'"${BOLD}${CYAN}Trash watcher${RESET} ${DIM}(Ctrl+C to stop)${RESET}"
+            print -r -- ""
+            print -r -- "  $line"
+            print -r -- ""
+            prev=$line
+        fi
+        sleep $WATCH_INTERVAL
+    done
+}
+
+# --- Completions -----------------------------------------------------------
+
 print_completion() {
-    local shell="$1"
-    case "$shell" in
-        bash)
-            cat <<'EOF'
-_trash() {
-    local cur prev opts
+    local shell=$1
+    case $shell in
+        bash) cat <<'EOF'
+_ztrash() {
+    local cur prev ops
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-l --list -r --restore -d --delete -e --empty -s --size -u --undo -w --watch -p --purge --fzf -v --verbose --version -h --help"
+    ops="-l --list -r --restore -d --delete -e --empty -s --size -u --undo"
+    ops+=" -w --watch -p --purge --fzf --gc -y --yes -n --dry-run"
+    ops+=" -v --verbose --json --version -h --help"
     case "$prev" in
         -p|--purge) return ;;
     esac
+    # Splitting compgen's newline-separated output into COMPREPLY is the
+    # standard completion idiom. `read -a` would split on spaces instead and
+    # mangle any candidate path containing one.
+    # shellcheck disable=SC2207
     if [[ ${cur} == -* ]]; then
-        COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${ops}" -- "${cur}") )
     else
-        COMPREPLY=( $(compgen -W "${opts} restore find" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${ops} restore find" -- "${cur}") )
     fi
+    return 0
 }
-complete -F _trash ztrash
+complete -F _ztrash ztrash
 EOF
-            ;;
-        zsh)
-            cat <<'EOF'
+        ;;
+        zsh) cat <<'EOF'
 #compdef ztrash
 
-_trash() {
+_ztrash() {
     local -a ops
     ops=(
-        '-l[list trash contents]'
-        '--list[list trash contents]'
-        '-r[interactively restore items]'
-        '--restore[interactively restore items]'
-        '-d[interactively delete items]'
-        '--delete[interactively delete items]'
-        '-e[empty the trash]'
-        '--empty[empty the trash]'
-        '-s[show trash size]'
-        '--size[show trash size]'
-        '-u[undo last trash]'
-        '--undo[undo last trash]'
-        '-w[watch trash size]'
-        '--watch[watch trash size]'
-        '-p[purge items older than N days]:days'
-        '--purge[purge items older than N days]:days'
-        '--fzf[fuzzy-find items]'
-        '-v[verbose output]'
-        '--verbose[verbose output]'
-        '-h[show help]'
-        '--help[show help]'
+        '(-l --list)'{-l,--list}'[list items in the trash]'
+        '(-r --restore)'{-r,--restore}'[interactively restore items]'
+        '(-d --delete)'{-d,--delete}'[interactively delete items]'
+        '(-e --empty)'{-e,--empty}'[empty the trash]'
+        '(-s --size)'{-s,--size}'[show trash size]'
+        '(-u --undo)'{-u,--undo}'[restore the most recently trashed item]'
+        '(-w --watch)'{-w,--watch}'[live-updating trash size display]'
+        '(-p --purge)'{-p,--purge}'[purge items older than N days]:days:'
+        '--fzf[fuzzy-find items to restore or delete]'
+        '--gc[remove orphaned trash entries]'
+        '(-y --yes)'{-y,--yes}'[assume yes, do not prompt]'
+        '(-n --dry-run)'{-n,--dry-run}'[show what would happen, change nothing]'
+        '(-v --verbose)'{-v,--verbose}'[verbose output]'
+        '--json[emit machine-readable JSON]'
         '--version[show version]'
-        'restore:restore items matching a pattern:'
-        'find:search trashed items:'
+        '(-h --help)'{-h,--help}'[show help]'
+        '--print-completion[print a shell completion script]:shell:(bash zsh fish)'
+        'restore:restore items matching a pattern:pattern:'
+        'find:search trashed items:pattern:'
     )
-    _arguments "$ops[@]" '*:files:_files'
+    _arguments -s -S "$ops[@]" '*:file:_files'
 }
-
-_trash "$@"
 EOF
-            ;;
-        fish)
-            cat <<'EOF'
-complete -c ztrash -s l -l list -d 'List trash contents'
+        ;;
+        fish) cat <<'EOF'
+complete -c ztrash -s l -l list -d 'List items in the trash'
 complete -c ztrash -s r -l restore -d 'Interactively restore items'
 complete -c ztrash -s d -l delete -d 'Interactively delete items'
 complete -c ztrash -s e -l empty -d 'Empty the trash'
 complete -c ztrash -s s -l size -d 'Show trash size'
-complete -c ztrash -s u -l undo -d 'Undo last trash'
-complete -c ztrash -s w -l watch -d 'Watch trash size'
+complete -c ztrash -s u -l undo -d 'Restore the most recently trashed item'
+complete -c ztrash -s w -l watch -d 'Live-updating trash size display'
 complete -c ztrash -s p -l purge -d 'Purge items older than N days' -r
-complete -c ztrash -l fzf -d 'Fuzzy-find items'
+complete -c ztrash -l fzf -d 'Fuzzy-find items to restore or delete'
+complete -c ztrash -l gc -d 'Remove orphaned trash entries'
+complete -c ztrash -s y -l yes -d 'Assume yes, do not prompt'
+complete -c ztrash -s n -l dry-run -d 'Show what would happen, change nothing'
 complete -c ztrash -s v -l verbose -d 'Verbose output'
-complete -c ztrash -s h -l help -d 'Show help'
+complete -c ztrash -l json -d 'Emit machine-readable JSON'
 complete -c ztrash -l version -d 'Show version'
+complete -c ztrash -s h -l help -d 'Show help'
+complete -c ztrash -l print-completion -d 'Print a shell completion script' -r -f -a 'bash zsh fish'
 complete -c ztrash -n '__fish_use_subcommand' -a restore -d 'Restore items matching a pattern'
 complete -c ztrash -n '__fish_use_subcommand' -a find -d 'Search trashed items'
 EOF
-            ;;
+        ;;
         *)
-            echo "${RED}Unknown shell: $shell (supported: bash, zsh, fish)${RESET}" >&2
+            warn "unknown shell: $shell (supported: bash, zsh, fish)"
             return 1
             ;;
     esac
 }
 
+# --- Help ------------------------------------------------------------------
+
 show_help() {
     cat <<EOF
 ${BOLD}${CYAN}Usage:${RESET} ${DIM}ztrash${RESET} [${GREEN}options${RESET}] [${YELLOW}file...${RESET}]
+       ${DIM}ztrash${RESET} ${GREEN}restore${RESET} ${YELLOW}<pattern>${RESET}
+       ${DIM}ztrash${RESET} ${GREEN}find${RESET} ${YELLOW}<pattern>${RESET}
 
 ${BOLD}${CYAN}Options:${RESET}
-  ${GREEN}-l, --list${RESET}          ${CYAN}List items in trash${RESET}
+  ${GREEN}-l, --list${RESET}          ${CYAN}List items in the trash${RESET}
   ${GREEN}-r, --restore${RESET}       ${CYAN}Interactively restore items${RESET}
-  ${GREEN}-d, --delete${RESET}        ${CYAN}Interactively delete specific items${RESET}
+  ${GREEN}-d, --delete${RESET}        ${CYAN}Interactively delete items${RESET}
   ${GREEN}-e, --empty${RESET}         ${CYAN}Empty the trash${RESET}
   ${GREEN}-s, --size${RESET}          ${CYAN}Show trash size${RESET}
   ${GREEN}-u, --undo${RESET}          ${CYAN}Restore the most recently trashed item${RESET}
   ${GREEN}-w, --watch${RESET}         ${CYAN}Live-updating trash size display${RESET}
-  ${GREEN}-p, --purge${RESET} ${YELLOW}<days>${RESET}  ${CYAN}Permanently delete items older than N days${RESET}
+  ${GREEN}-p, --purge${RESET} ${YELLOW}<days>${RESET}  ${CYAN}Delete items older than N days (default ${YELLOW}$PURGE_DAYS${CYAN})${RESET}
   ${GREEN}--fzf${RESET}               ${CYAN}Fuzzy-find items to restore or delete${RESET}
+  ${GREEN}--gc${RESET}                ${CYAN}Remove orphaned trash entries${RESET}
+  ${GREEN}-y, --yes${RESET}           ${CYAN}Assume yes, do not prompt${RESET}
+  ${GREEN}-n, --dry-run${RESET}        ${CYAN}Show what would happen, change nothing${RESET}
   ${GREEN}-v, --verbose${RESET}       ${CYAN}Verbose output${RESET}
+  ${GREEN}--json${RESET}              ${CYAN}Emit machine-readable JSON (with -l/-s)${RESET}
   ${GREEN}--version${RESET}           ${CYAN}Show version${RESET}
   ${GREEN}-h, --help${RESET}          ${CYAN}Show this help message${RESET}
 
 ${BOLD}${MAGENTA}Subcommands:${RESET}
-  ${GREEN}restore${RESET} ${YELLOW}<pattern>${RESET}   ${MAGENTA}Restore items matching a pattern${RESET}
+  ${GREEN}restore${RESET} ${YELLOW}<pattern>${RESET}   ${MAGENTA}Restore items matching a glob${RESET}
   ${GREEN}find${RESET} ${YELLOW}<pattern>${RESET}      ${MAGENTA}Search trashed items by name or path${RESET}
 
 ${BOLD}${BLUE}Description:${RESET}
-  If no options are provided, moves the specified files or directories
-  to the trash according to the ${BOLD}FreeDesktop.org${RESET} specification.
+  With no options, moves the given files or directories to the trash following
+  the ${BOLD}FreeDesktop.org${RESET} specification, including the per-filesystem
+  trash directories that other desktop environments read.
+
+${BOLD}${YELLOW}Environment:${RESET}
+  ${DIM}XDG_DATA_HOME${RESET}      trash lives in \$XDG_DATA_HOME/Trash
+  ${DIM}XDG_CONFIG_HOME${RESET}    where the config file is read from
+  ${DIM}ZTRASH_TRASH_DIR${RESET}   use a different trash root entirely
+  ${DIM}ZTRASH_CONFIG_DIR${RESET}  set a different config directory
+  ${DIM}ZTRASH_PURGE_DAYS${RESET}  default age for ${DIM}--purge${RESET} (${YELLOW}$PURGE_DAYS${RESET})
+  ${DIM}ZTRASH_INTERVAL${RESET}    watcher refresh interval in seconds
+  ${DIM}ZTRASH_COLS${RESET}        force the assumed terminal width
+  ${DIM}ZTRASH_NO_COLOR${RESET}    or ${DIM}NO_COLOR${RESET} to disable colour
+  ${DIM}ZTRASH_FORCE_COLOR${RESET}  keep colour when piping
+  ${DIM}${RESET}                   see ${DIM}man ztrash${RESET} for the full list
 
 ${BOLD}${YELLOW}Examples:${RESET}
   ${DIM}ztrash${RESET} ${CYAN}homework.pdf${RESET} ${CYAN}regrettable_photo.jpg${RESET}
-  ${DIM}ztrash${RESET} ${GREEN}-l${RESET}
-  ${DIM}ztrash${RESET} ${GREEN}-p${RESET} ${YELLOW}30${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}-l${RESET} ${DIM}|${RESET} ${GREEN}less${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}-p${RESET} ${YELLOW}30${RESET} ${GREEN}-n${RESET} ${DIM}# preview first${RESET}
   ${DIM}ztrash${RESET} ${GREEN}restore${RESET} ${YELLOW}"*.bak"${RESET}
   ${DIM}ztrash${RESET} ${GREEN}find${RESET} ${YELLOW}important${RESET}
+  ${DIM}ztrash${RESET} ${GREEN}--gc${RESET} ${DIM}# drop orphaned entries${RESET}
 EOF
 }
 
-# --- Actions ---
+# --- Argument parsing ------------------------------------------------------
 
-list_trash() {
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    if [[ ${#info_files} -eq 0 ]]; then
-        echo "${GREEN}Trash is empty.${RESET}"
-        return
-    fi
+typeset -a TARGETS
+TARGETS=()
+typeset -g OP=""
+typeset -g OP_ARG=""
+typeset -i HAVE_OP=0
 
-    local total_items=${#info_files}
-    local lines=() total_bytes=0
-    local term_cols=${COLUMNS:-80}
-    local path_col=$(( term_cols - 28 ))
+set_op() { OP=$1; OP_ARG=$2; HAVE_OP=1 }
 
-    for f in $info_files; do
-        local binned_date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
-        local encoded_path=$(grep "^Path=" "$f" | cut -d= -f2-)
-        local decoded_path=$(url_decode "${encoded_path:-}")
-        local base=$(basename "$f" .trashinfo)
-        local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
-        fbytes=${fbytes:-0}
-        local fsize=$(format_bytes $fbytes)
-        total_bytes=$(( total_bytes + fbytes ))
-        decoded_path=$(truncate_path "$decoded_path" $path_col)
-        lines+=("${binned_date:-Unknown}|${fsize}|${decoded_path:-${encoded_path:-Unknown}}")
-    done
+parse_args() {
+    local -a args
+    args=("$@")
+    local -i n=$#args i=1
+    local -i no_more_opts=0
+    local a
+    # Modifier flags are accepted anywhere, including after a subcommand:
+    # `ztrash restore '*.log' -y` is what people actually type.
+    local -a rest
+    local -i j
 
-    local total_fmt=$(format_bytes $total_bytes)
-
-    echo "  ${BOLD}${CYAN}Trash${RESET}  ${DIM}(${YELLOW}$total_items${RESET}${DIM} item(s), ${YELLOW}$total_fmt${RESET}${DIM})${RESET}"
-    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
-    printf "  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  ${BLUE}%s${RESET}\n" "Binned" "Size" "Path"
-    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
-
-    local sorted_lines=("${(@f)$(printf '%s\n' "${lines[@]}" | sort -t'|' -k1,1r)}")
-    local idx=0
-    for line in "${sorted_lines[@]}"; do
-        local parts=("${(s:|:)line}")
-        if (( idx % 2 == 0 )); then
-            printf "  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  %s\n" "$parts[1]" "$parts[2]" "$parts[3]"
-        else
-            printf "${DIM}  ${CYAN}%-17s${RESET}  ${YELLOW}%5s${RESET}  %s${RESET}\n" "$parts[1]" "$parts[2]" "$parts[3]"
-        fi
-        ((idx++))
-    done
-
-    echo "  ${DIM}─────────────────  ─────  ─────────────────────────────────${RESET}"
-    printf "  %-17s  ${BOLD}${YELLOW}%5s${RESET}  ${BOLD}${BLUE}%s${RESET}\n" "" "$total_fmt" "Total"
-}
-
-move_to_trash() {
-    local verbose=false
-    if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
-        verbose=true
-        shift
-    fi
-
-    if [[ $# -eq 0 ]]; then
-        show_help
-        return 1
-    fi
-
-    for target in "$@"; do
-        if [[ ! -e "$target" && ! -L "$target" ]]; then
-            echo "${RED}Error: '$target' does not exist.${RESET}" >&2
+    while (( i <= n )); do
+        a=${args[i]}
+        if (( no_more_opts )); then
+            TARGETS+=("$a")
+            (( i++ ))
             continue
         fi
-
-        local abs_path=$(realpath -s "$target")
-        local base_name=$(basename "$abs_path")
-        local date_stamp=$(date +%Y-%m-%dT%H:%M:%S)
-        local encoded=$(url_encode "$abs_path")
-
-        local unique_name="${base_name}_${$}_${RANDOM}"
-        while [[ -e "$FILES_DIR/$unique_name" ]]; do
-            unique_name="${base_name}_${$}_${RANDOM}"
-        done
-
-        if mv -n "$target" "$FILES_DIR/$unique_name" 2>/dev/null; then
-            :
-        else
-            unique_name="${base_name}_${$}_${RANDOM}"
-            if ! cp -a "$target" "$FILES_DIR/$unique_name" 2>/dev/null; then
-                echo "${RED}Error: Failed to move '$target' to trash.${RESET}" >&2
-                continue
-            fi
-            rm -rf "$target"
-        fi
-
-        cat <<EOF > "$INFO_DIR/${unique_name}.trashinfo"
-[Trash Info]
-Path=$encoded
-DeletionDate=$date_stamp
-EOF
-        [[ "$verbose" == true ]] && echo "  ${GREEN}✓${RESET} ${BOLD}Binned${RESET} '${CYAN}$(basename "$target")${RESET}'"
-    done
-}
-
-empty_trash() {
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    local count=${#info_files}
-    local total_size=$(du -sh "$FILES_DIR" | cut -f1)
-    [[ "$total_size" == "0" ]] && total_size="0B"
-    echo -n "${RED}${BOLD}Really empty the trash?${RESET} ${YELLOW}$count${RESET} item(s), ${BOLD}${YELLOW}$total_size${RESET}. [${RED}y${RESET}/${DIM}N${RESET}]: "
-    read -r answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        rm -rf "$FILES_DIR"/*(DN) "$INFO_DIR"/*(DN)
-        echo "${GREEN}${BOLD}Trash emptied.${RESET} ${YELLOW}$total_size${RESET} freed."
-    else
-        echo "${YELLOW}Aborted.${RESET} Trash not emptied."
-    fi
-}
-
-show_size() {
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    local total_size=$(du -sh "$FILES_DIR" | cut -f1)
-    echo "Trash size: ${BOLD}${YELLOW}$total_size${RESET} ${DIM}(${CYAN}${#info_files}${RESET}${DIM} item(s))${RESET}"
-}
-
-undo_trash() {
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    if [[ ${#info_files} -eq 0 ]]; then
-        echo "${YELLOW}Nothing to undo.${RESET} The bin is empty."
-        return
-    fi
-
-    local newest="" newest_date=""
-    for f in $info_files; do
-        local d=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
-        [[ -z "$d" ]] && continue
-        if [[ -z "$newest_date" || "$d" > "$newest_date" ]]; then
-            newest_date="$d"
-            newest="$f"
-        fi
-    done
-
-    if [[ -z "$newest" ]]; then
-        echo "${YELLOW}Nothing to undo.${RESET}"
-        return
-    fi
-
-    local base=$(basename "$newest" .trashinfo)
-    local encoded_path=$(grep "^Path=" "$newest" | cut -d= -f2-)
-    [[ -z "$encoded_path" ]] && return
-    local decoded_path=$(url_decode "$encoded_path")
-    [[ -z "$decoded_path" ]] && return
-    local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
-    local fsize=$(format_bytes ${fbytes:-0})
-
-    if [[ -e "$decoded_path" ]]; then
-        local term_cols=${COLUMNS:-80}
-        local disp=$(truncate_path "$decoded_path" $(( term_cols - 40 )))
-        echo -n "${YELLOW}'$disp' already exists. Overwrite? [y/N]: ${RESET}"
-        read -r ov
-        [[ ! "$ov" =~ ^[Yy]$ ]] && return
-    fi
-    mkdir -p "$(dirname "$decoded_path")"
-    if mv "$FILES_DIR/$base" "$decoded_path"; then
-        rm -f "$INFO_DIR/$base.trashinfo"
-        echo "  ${GREEN}✓${RESET} Undone: '$(basename "$decoded_path")' (${fsize})"
-    else
-        echo "  ${RED}✗${RESET} Failed to undo" >&2
-    fi
-}
-
-watch_trash() {
-    while true; do
-        clear
-        printf "${BOLD}${CYAN}Trash watcher${RESET} ${DIM}(Ctrl+C to stop)${RESET}\n\n"
-        show_size
-        sleep 2
-    done
-}
-
-fzf_action() {
-    if ! command -v fzf >/dev/null 2>&1; then
-        echo "${RED}fzf is not installed. Install it with your package manager.${RESET}" >&2
-        return 1
-    fi
-
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    if [[ ${#info_files} -eq 0 ]]; then
-        echo "${GREEN}The bin is empty.${RESET}"
-        return
-    fi
-
-    local fzf_input=()
-    for f in $info_files; do
-        local base=$(basename "$f" .trashinfo)
-        local date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
-        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
-        local decoded=$(url_decode "$encoded")
-        local size=$(get_size "$FILES_DIR/$base")
-        fzf_input+=("$base|$date | $size | $decoded")
-    done
-
-    local choice=$(printf "%s\n" "${fzf_input[@]}" | fzf --reverse --prompt="Select item: " --with-nth=2.. --delimiter="|")
-    [[ -z "$choice" ]] && return
-
-    local trash_name="${choice%%|*}"
-    [[ -z "$trash_name" ]] && return
-    local encoded=$(grep "^Path=" "$INFO_DIR/$trash_name.trashinfo" | cut -d= -f2-)
-    [[ -z "$encoded" ]] && return
-    local orig_path=$(url_decode "$encoded")
-    [[ -z "$orig_path" ]] && return
-
-    echo "${CYAN}Selected:${RESET} ${BOLD}$(basename "$orig_path")${RESET}"
-    echo -n "${BOLD}${GREEN}(R)estore${RESET} or ${BOLD}${RED}(D)elete${RESET}? [${GREEN}r${RESET}/${RED}D${RESET}/${DIM}q${RESET}]: "
-    read -r action
-    case "$action" in
-        [Rr])
-            if [[ -e "$orig_path" ]]; then
-                echo -n "${YELLOW}Overwrite? [y/N]: ${RESET}"
-                read -r ov
-                [[ ! "$ov" =~ ^[Yy]$ ]] && return
-            fi
-            mkdir -p "$(dirname "$orig_path")"
-            if mv "$FILES_DIR/$trash_name" "$orig_path"; then
-                rm -f "$INFO_DIR/$trash_name.trashinfo"
-                echo "Restored ${GREEN}'$(basename "$orig_path")'${RESET}."
-            fi
-            ;;
-        [Dd])
-            rm -rf "$FILES_DIR/$trash_name" "$INFO_DIR/$trash_name.trashinfo"
-            echo "Destroyed ${RED}$trash_name${RESET}."
-            ;;
-    esac
-}
-
-find_trash() {
-    local pattern="$1"
-    if [[ -z "$pattern" ]]; then
-        echo "${RED}Usage: ztrash find <pattern>${RESET}" >&2
-        return 1
-    fi
-
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    local found=0
-    for f in $info_files; do
-        local base=$(basename "$f" .trashinfo)
-        local date=$(grep "^DeletionDate=" "$f" | cut -d= -f2)
-        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
-        [[ -z "$encoded" ]] && continue
-        local decoded=$(url_decode "$encoded")
-        [[ -z "$decoded" ]] && continue
-        local name=$(basename "$decoded")
-        if [[ "$name" == *$~pattern* || "$decoded" == *$~pattern* ]]; then
-            if [[ $found -eq 0 ]]; then
-                echo "  ${BOLD}${CYAN}Matching${RESET} '${YELLOW}$pattern${RESET}'"
-                echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
-                printf "  ${CYAN}%-17s${RESET}  ${BLUE}%s${RESET}\n" "Binned" "Path"
-                echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
-            fi
-            local term_cols=${COLUMNS:-80}
-            local display_path=$(truncate_path "$decoded" $(( term_cols - 21 )))
-            printf "  ${CYAN}%-17s${RESET}  ${BLUE}%s${RESET}\n" "${date:-Unknown}" "$display_path"
-            ((found++))
-        fi
-    done
-    if [[ $found -eq 0 ]]; then
-        echo "  ${YELLOW}No items match '$pattern'.${RESET}"
-    else
-        echo "  ${DIM}───────────────────  ─────────────────────────────────────────────${RESET}"
-        echo "  ${CYAN}$found${RESET}${DIM} item(s) found${RESET}"
-    fi
-}
-
-restore_pattern() {
-    local pattern="$1"
-    if [[ -z "$pattern" ]]; then
-        echo "${RED}Usage: ztrash restore <pattern>${RESET}" >&2
-        return 1
-    fi
-
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    local restored=0
-    for f in $info_files; do
-        local base=$(basename "$f" .trashinfo)
-        local encoded=$(grep "^Path=" "$f" | cut -d= -f2-)
-        [[ -z "$encoded" ]] && continue
-        local decoded=$(url_decode "$encoded")
-        [[ -z "$decoded" ]] && continue
-        local name=$(basename "$decoded")
-        if [[ "$name" == *$~pattern* || "$decoded" == *$~pattern* ]]; then
-            if [[ -e "$decoded" ]]; then
-                local term_cols=${COLUMNS:-80}
-                local disp=$(truncate_path "$decoded" $(( term_cols - 40 )))
-                echo -n "  ${YELLOW}?${RESET} '$disp' exists. Overwrite? [y/N]: ${RESET}"
-                read -r ov
-                [[ ! "$ov" =~ ^[Yy]$ ]] && continue
-            fi
-            local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
-            local fsize=$(format_bytes ${fbytes:-0})
-            mkdir -p "$(dirname "$decoded")"
-            if mv "$FILES_DIR/$base" "$decoded"; then
-                rm -f "$INFO_DIR/$base.trashinfo"
-                echo "  ${GREEN}✓${RESET} Restored '$(basename "$decoded")' (${fsize})"
-                ((restored++))
-            fi
-        fi
-    done
-    if [[ $restored -eq 0 ]]; then
-        echo "  ${YELLOW}No items matched '$pattern'.${RESET}"
-    else
-        echo "  ${GREEN}Restored ${CYAN}$restored${RESET}${GREEN} item(s).${RESET}"
-    fi
-}
-
-interactive_action() {
-    local action="$1"
-    local info_files=("$INFO_DIR"/*.trashinfo(N))
-    if [[ ${#info_files} -eq 0 ]]; then
-        echo "${YELLOW}Nothing to $action.${RESET} The bin is empty."
-        return
-    fi
-
-    local total_items=${#info_files}
-    local i=1 items=() total_bytes=0
-    local action_label="restore"
-    [[ "$action" == "delete" ]] && action_label="permanently delete"
-
-    local term_cols=${COLUMNS:-80}
-
-    echo "  ${BOLD}${CYAN}Select items to $action_label${RESET}"
-    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
-    printf "${DIM}  %3s  %5s  %-20s  %s${RESET}\n" "  #" "Size" "Name" "Original Path"
-    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
-
-    for f in $info_files; do
-        local base=$(basename "$f" .trashinfo)
-        local encoded_path=$(grep "^Path=" "$f" | cut -d= -f2-)
-        [[ -z "$encoded_path" ]] && continue
-        local decoded_path=$(url_decode "$encoded_path")
-        [[ -z "$decoded_path" ]] && continue
-        local fbytes=$(du -sb "$FILES_DIR/$base" 2>/dev/null | cut -f1)
-        fbytes=${fbytes:-0}
-        local fsize=$(format_bytes $fbytes)
-        total_bytes=$(( total_bytes + fbytes ))
-        items+=("$base|$decoded_path")
-        local display_path=$(truncate_path "$decoded_path" $(( term_cols - 36 )))
-        printf "  ${CYAN}%2d)${RESET}  ${YELLOW}%5s${RESET}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" $i "$fsize" "$(basename "$decoded_path")" "$display_path"
-        ((i++))
-    done
-
-    local total_fmt=$(format_bytes $total_bytes)
-    local item_count=$((i - 1))
-    echo "  ${DIM}──────────────────────────────────────────────────────────────────────────${RESET}"
-    echo "  ${CYAN}$item_count${RESET}${DIM} item(s), ${YELLOW}$total_fmt${RESET}${RESET}"
-    echo
-
-    echo -n "${BOLD}${CYAN}Numbers to $action_label${RESET} ${DIM}(e.g. 1 2 5, 1-5, all)${RESET} or '${RED}q${RESET}': "
-    read -r response
-    [[ "$response" == "q" || -z "$response" ]] && return
-
-    response="${response//,/ }"
-    local choices=()
-    for token in $=response; do
-        if [[ "$token" == "all" ]]; then
-            choices=()
-            for n in {1..$item_count}; do choices+=($n); done
-            break
-        elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            for n in $(seq $match[1] $match[2]); do choices+=($n); done
-        elif [[ "$token" =~ ^[0-9]+$ ]]; then
-            choices+=($token)
-        fi
-    done
-
-    for choice in $choices; do
-        if (( choice > 0 && choice < i )); then
-            local mapping=("${(s:|:)items[$choice]}")
-            local trash_name=$mapping[1]
-            local orig_path=$mapping[2]
-
-            if [[ "$action" == "restore" ]]; then
-                if [[ -e "$orig_path" ]]; then
-                    local disp=$(truncate_path "$orig_path" $(( term_cols - 40 )))
-                    echo -n "${YELLOW}'$disp' already exists. Overwrite? [y/N]: ${RESET}"
-                    read -r ov
-                    [[ ! "$ov" =~ ^[Yy]$ ]] && continue
-                fi
-                mkdir -p "$(dirname "$orig_path")"
-                if mv "$FILES_DIR/$trash_name" "$orig_path"; then
-                    rm -f "$INFO_DIR/$trash_name.trashinfo"
-                    echo "  ${GREEN}✓${RESET} Restored '$(basename "$orig_path")'"
+        case $a in
+            --)                    no_more_opts=1 ;;
+            -y|--yes)              ASSUME_YES=1 ;;
+            -n|--dry-run)          DRY_RUN=1 ;;
+            -v|--verbose)          VERBOSE=1 ;;
+            --json)                USE_JSON=1 ;;
+            -l|--list)             set_op list "" ;;
+            -r|--restore)          set_op restore "" ;;
+            -d|--delete)           set_op delete "" ;;
+            -e|--empty)            set_op empty "" ;;
+            -s|--size)             set_op size "" ;;
+            -u|--undo)             set_op undo "" ;;
+            -w|--watch)            set_op watch "" ;;
+            --fzf)                 set_op fzf "" ;;
+            --gc)                  set_op gc "" ;;
+            -p|--purge)
+                (( i++ ))
+                if (( i > n )) || [[ ${args[i]} == -* ]]; then
+                    # A bare --purge, or one followed by another flag, means
+                    # "use the configured age".
+                    set_op purge "$PURGE_DAYS"
+                elif [[ ${args[i]} == <-> ]]; then
+                    set_op purge "${args[i]}"
                 else
-                    echo "  ${RED}✗${RESET} Failed to restore $trash_name" >&2
+                    die_usage "option '$a' requires a number of days."
                 fi
-            elif [[ "$action" == "delete" ]]; then
-                rm -rf "$FILES_DIR/$trash_name" "$INFO_DIR/$trash_name.trashinfo"
-                echo "  ${RED}✗${RESET} Deleted $trash_name"
-            fi
-        else
-            echo "  ${YELLOW}!${RESET} Invalid choice: $choice"
-        fi
+                ;;
+            -h|--help)             show_help; exit $EXIT_OK ;;
+            --version)             print -r -- "ztrash version $VERSION"; exit $EXIT_OK ;;
+            --print-completion)
+                (( i++ ))
+                (( i > n )) && die_usage "option '--print-completion' requires a shell name."
+                set_op completion "${args[i]}"
+                ;;
+            -*)                    die_usage "unknown option: $a." ;;
+            find|restore)
+                # A subcommand owns the rest of the command line, except for
+                # the modifier flags, which are still honoured wherever they
+                # appear.
+                rest=()
+                for (( j = i + 1; j <= n; j++ )); do
+                    case ${args[j]} in
+                        -y|--yes)          ASSUME_YES=1 ;;
+                        -n|--dry-run)      DRY_RUN=1 ;;
+                        -v|--verbose)      VERBOSE=1 ;;
+                        *)                 rest+=("${args[j]}") ;;
+                    esac
+                done
+                set_op "sub:$a" "${rest[@]}"
+                break
+                ;;
+            *)                     TARGETS+=("$a") ;;
+        esac
+        (( i++ ))
     done
 }
 
-# --- Main routing logic ---
-
-if [[ $# -eq 0 ]]; then
-    show_help
-    exit 0
-fi
-
-case "$1" in
-    -l|--list)    list_trash ;;
-    -r|--restore) interactive_action "restore" ;;
-    -d|--delete)  interactive_action "delete" ;;
-    -e|--empty)   empty_trash ;;
-    -s|--size)    show_size ;;
-    -u|--undo)    undo_trash ;;
-    -v|--verbose)
-        shift
-        move_to_trash -v "$@"
-        ;;
-    -w|--watch)   watch_trash ;;
-    --fzf)        fzf_action ;;
-    --version)
-        echo "ztrash version $VERSION"
-        exit 0
-        ;;
-    --print-completion)
-        if [[ $# -lt 2 ]]; then
-            echo "${RED}Usage: ztrash --print-completion bash|zsh|fish${RESET}" >&2
-            exit 1
+trash_targets() {
+    local -i rc=0
+    local t
+    for t in $TARGETS; do
+        if [[ ! -e $t && ! -L $t ]]; then
+            warn "'$t' does not exist."
+            rc=$EXIT_FAIL
+            continue
         fi
-        print_completion "$2"
-        ;;
-    -p|--purge)
-        if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
-            echo "${RED}Error: --purge requires a number of days${RESET}" >&2
-            exit 1
-        fi
-        purge_trash "$2"
-        ;;
-    find)
-        shift
-        find_trash "$@"
-        ;;
-    restore)
-        shift
-        restore_pattern "$@"
-        ;;
-    -h|--help)    show_help ;;
-    -*)
-        echo "${RED}Unknown option: $1.${RESET}"
+        trash_one "$t" || rc=$EXIT_FAIL
+    done
+    return $rc
+}
+
+dispatch() {
+    local -i rc=0
+    if (( HAVE_OP )); then
+        case $OP in
+            list)             list_trash ;;
+            size)             show_size ;;
+            restore)          interactive_action restore ;;
+            delete)           interactive_action delete ;;
+            empty)            empty_trash ;;
+            undo)             undo_trash ;;
+            watch)            watch_trash ;;
+            purge)            purge_trash "$OP_ARG" ;;
+            fzf)              fzf_action ;;
+            gc)               gc_trash ;;
+            completion)       print_completion "$OP_ARG" || exit $EXIT_USAGE ;;
+            sub:find)         find_trash "$OP_ARG" ;;
+            sub:restore)      restore_pattern "$OP_ARG" ;;
+            *)                die_usage "unknown operation: $OP." ;;
+        esac
+        rc=$?
+        exit $rc
+    fi
+    if (( ${#TARGETS} == 0 )); then
         show_help
-        exit 1
-        ;;
-    *)
-        move_to_trash "$@"
-        ;;
-esac
+        exit $EXIT_OK
+    fi
+    trash_targets
+    exit $?
+}
+
+main() {
+    init_colors
+    init_now
+    detect_du_batch
+    mkdir -p -- "$TRASH_ROOT/files" "$TRASH_ROOT/info" 2>/dev/null
+    parse_args "$@"
+    dispatch
+}
+
+main "$@"
