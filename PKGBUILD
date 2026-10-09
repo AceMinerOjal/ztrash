@@ -1,7 +1,7 @@
 # Maintainer: AceMinerOjal <ojalkhatiwada6c@gmail.com>
 
 pkgname=ztrash
-pkgver=1.1.0
+pkgver=1.1.1
 pkgrel=1
 pkgdesc="A polished, FreeDesktop-compliant trash manager with fzf integration, live watcher, and pattern restore"
 arch=('any')

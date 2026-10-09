@@ -2,6 +2,7 @@
 
 _ztrash() {
     local -a ops
+    local state
     ops=(
         '(-l --list)'{-l,--list}'[list items in the trash]'
         '(-r --restore)'{-r,--restore}'[interactively restore items]'
@@ -20,8 +21,16 @@ _ztrash() {
         '--version[show version]'
         '(-h --help)'{-h,--help}'[show help]'
         '--print-completion[print a shell completion script]:shell:(bash zsh fish)'
-        'restore:restore items matching a pattern:pattern:'
-        'find:search trashed items:pattern:'
     )
-    _arguments -s -S "$ops[@]" '*:file:_files'
+    _arguments -s -S "$ops[@]" \
+        '1:subcommand or file:->subcmd' \
+        '*:file:_files'
+    case $state in
+        subcmd)
+            _alternative \
+                'subcommands:subcommand:(restore find)' \
+                'files:file:_files'
+            ;;
+    esac
 }
+compdef _ztrash ztrash

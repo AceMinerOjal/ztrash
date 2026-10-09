@@ -15,7 +15,7 @@
 # The above copyright notice and this permission notice shall be included in
 # all copies or substantial portions of the Software.
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # --- Options ---
 setopt EXTENDED_GLOB NO_UNSET NO_ALIASES
@@ -1092,9 +1092,13 @@ _ztrash() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     ops="-l --list -r --restore -d --delete -e --empty -s --size -u --undo"
     ops+=" -w --watch -p --purge --fzf --gc -y --yes -n --dry-run"
-    ops+=" -v --verbose --json --version -h --help"
+    ops+=" -v --verbose --json --version -h --help --print-completion"
     case "$prev" in
         -p|--purge) return ;;
+        --print-completion)
+            # shellcheck disable=SC2207
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
+            return ;;
     esac
     # Splitting compgen's newline-separated output into COMPREPLY is the
     # standard completion idiom. `read -a` would split on spaces instead and
@@ -1115,6 +1119,7 @@ EOF
 
 _ztrash() {
     local -a ops
+    local state
     ops=(
         '(-l --list)'{-l,--list}'[list items in the trash]'
         '(-r --restore)'{-r,--restore}'[interactively restore items]'
@@ -1133,11 +1138,19 @@ _ztrash() {
         '--version[show version]'
         '(-h --help)'{-h,--help}'[show help]'
         '--print-completion[print a shell completion script]:shell:(bash zsh fish)'
-        'restore:restore items matching a pattern:pattern:'
-        'find:search trashed items:pattern:'
     )
-    _arguments -s -S "$ops[@]" '*:file:_files'
+    _arguments -s -S "$ops[@]" \
+        '1:subcommand or file:->subcmd' \
+        '*:file:_files'
+    case $state in
+        subcmd)
+            _alternative \
+                'subcommands:subcommand:(restore find)' \
+                'files:file:_files'
+            ;;
+    esac
 }
+compdef _ztrash ztrash
 EOF
         ;;
         fish) cat <<'EOF'

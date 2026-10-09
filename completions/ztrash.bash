@@ -5,9 +5,13 @@ _ztrash() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     ops="-l --list -r --restore -d --delete -e --empty -s --size -u --undo"
     ops+=" -w --watch -p --purge --fzf --gc -y --yes -n --dry-run"
-    ops+=" -v --verbose --json --version -h --help"
+    ops+=" -v --verbose --json --version -h --help --print-completion"
     case "$prev" in
         -p|--purge) return ;;
+        --print-completion)
+            # shellcheck disable=SC2207
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
+            return ;;
     esac
     # Splitting compgen's newline-separated output into COMPREPLY is the
     # standard completion idiom. `read -a` would split on spaces instead and
